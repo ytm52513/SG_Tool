@@ -339,51 +339,8 @@ def login():
         debug_log(f"[LOGIN] token 获取成功 (len={len(token)})")
         debug_log(f"[LOGIN] alipay_url: {alipay_url[:200]}")
 
-        # 方法1：使用最原始的URL修改方案（可能最稳定）
-        # 直接修改alipays:// URL中的url参数
-        from urllib.parse import parse_qs, unquote, quote
-        
-        # 解析原始URL
-        parsed = urlparse(alipay_url)
-        query = parse_qs(parsed.query)
-        
-        if 'scheme' in query:
-            scheme_val = query['scheme'][0]
-            decoded_scheme = unquote(scheme_val)
-            debug_log(f"[LOGIN] decoded_scheme (前200): {decoded_scheme[:200]}")
-            
-            if decoded_scheme.startswith('alipays://platformapi/startapp?'):
-                # 解析alipays:// URL
-                if '?' in decoded_scheme:
-                    alipays_path, alipays_query = decoded_scheme.split('?', 1)
-                    alipays_params = parse_qs(alipays_query)
-                    
-                    if 'url' in alipays_params:
-                        # 构建我们的回调URL
-                        base = get_base_url()
-                        our_callback = f"{base}/callback?token={quote(token)}"
-                        
-                        # 修改alipays的url参数
-                        alipays_params['url'] = [our_callback]
-                        
-                        # 重建alipays:// URL
-                        new_alipays_query = urlencode(alipays_params, doseq=True)
-                        new_scheme = f"{alipays_path}?{new_alipays_query}"
-                        
-                        # 重新编码并放回外层URL
-                        query['scheme'] = [quote(new_scheme, safe='')]
-                        
-                        # 重建完整URL
-                        new_query = urlencode(query, doseq=True)
-                        final_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
-                        
-                        debug_log(f"[LOGIN] 最终跳转URL (前200): {final_url[:200]}")
-                        debug_log(f"[LOGIN] 执行302跳转...")
-                        
-                        return redirect(final_url, code=302)
-        
-        # 方法2：如果方法1失败，使用原始URL
-        debug_log(f"[LOGIN] URL修改失败，使用原始支付宝URL")
+        # 保持支付宝URL原样，直接跳转
+        debug_log(f"[LOGIN] 使用原始支付宝URL进行跳转")
         debug_log(f"[LOGIN] 执行302跳转...")
         
         return redirect(alipay_url, code=302)
