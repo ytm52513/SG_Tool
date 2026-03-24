@@ -335,7 +335,7 @@ def login():
 
     token, alipay_url = fetch_fresh_token_and_url()
 
-        if token and alipay_url:
+    if token and alipay_url:
         debug_log(f"[LOGIN] token 获取成功 (len={len(token)})")
         debug_log(f"[LOGIN] alipay_url: {alipay_url[:200]}")
 
