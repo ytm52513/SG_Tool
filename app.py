@@ -10,24 +10,20 @@ API:
   GET /login        -> 实时获取token并302重定向到支付宝
   GET /callback     -> 登录回调，保存账号信息
   GET /admin        -> 管理页面（更新token等配置）
-  GET /qr           -> 下载二维码图片
-  GET /             -> 首页，展示二维码
+  GET /             -> 首页，前端JS生成二维码
   POST /api/token   -> 更新配置中的token
   GET /api/accounts -> 查看已收集的账号
   GET /api/health   -> 健康检查
 """
 
 import os
-import io
 import json
 import time
-import secrets
 import threading
 from datetime import datetime
 
 import requests
-import qrcode
-from flask import Flask, request, redirect, jsonify, send_file, Response
+from flask import Flask, request, redirect, jsonify, Response
 
 app = Flask(__name__)
 
@@ -83,28 +79,8 @@ def fetch_fresh_token():
     return None, None
 
 
-def generate_qr_image(url):
-    """生成二维码图片（返回bytes）"""
-    qr = qrcode.QRCode(
-        version=2,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=10,
-        border=4,
-    )
-    qr.add_data(url)
-    qr.make(fit=True)
-
-    img = qr.make_image(fill_color="black", back_color="white")
-    buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    buf.seek(0)
-    return buf
-
-
 def get_base_url():
     """获取当前服务的基础URL"""
-    # Railway 等平台会设置 PORT 环境变量
-    # 这里用请求的scheme和host来自动适配
     return request.host_url.rstrip('/')
 
 
@@ -113,14 +89,13 @@ def get_base_url():
 @app.route('/')
 def index():
     """首页 - 展示二维码"""
-    base = get_base_url()
-    login_url = f"{base}/login"
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{config['site_title']} - 扫码登录</title>
+    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
@@ -149,9 +124,13 @@ def index():
             border-radius: 12px;
             padding: 20px;
             margin: 20px 0;
-            display: inline-block;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 250px;
         }}
-        .qr-box img {{ max-width: 250px; width: 100%; }}
+        .qr-box img {{ max-width: 220px; }}
+        .qr-box canvas {{ max-width: 220px; }}
         .tip {{
             background: #fff3cd;
             border: 1px solid #ffc107;
@@ -172,23 +151,36 @@ def index():
         }}
         .stats {{ color: #999; font-size: 12px; margin-top: 15px; }}
         .footer {{ color: rgba(255,255,255,0.6); font-size: 12px; margin-top: 30px; }}
+        .loading {{ color: #999; font-size: 14px; }}
     </style>
 </head>
 <body>
     <div class="container">
         <h1>{config['site_title']}</h1>
         <div class="subtitle">支付宝扫码登录</div>
-        <span class="badge">永久有效</span>
+        <span class="badge">本码永久有效</span>
         <div class="qr-box">
-            <img src="/qr" alt="登录二维码">
+            <div id="qrcode" class="loading">加载中...</div>
         </div>
         <div class="tip">
             打开支付宝 App 扫描二维码<br>
             确认后自动登录游戏
         </div>
-        <div class="stats">已扫码 {config['scan_count']} 次</div>
+        <div class="stats">已扫码 <span id="scanCount">0</span> 次</div>
     </div>
     <div class="footer">Powered by Cloud Server</div>
+    <script>
+        // 生成二维码：指向当前域名的 /login 路径
+        const loginUrl = window.location.origin + '/login';
+        new QRCode(document.getElementById('qrcode'), {{
+            text: loginUrl,
+            width: 220,
+            height: 220,
+            colorDark: '#000000',
+            colorLight: '#ffffff',
+            correctLevel: QRCode.CorrectLevel.M
+        }});
+    </script>
 </body>
 </html>"""
 
@@ -210,15 +202,6 @@ def login():
     else:
         app.logger.error(f"[SCAN] FAILED to get token")
         return Response("Server error, please try again later", status=503)
-
-
-@app.route('/qr')
-def qr_image():
-    """生成并返回二维码图片"""
-    base = get_base_url()
-    login_url = f"{base}/login"
-    buf = generate_qr_image(login_url)
-    return send_file(buf, mimetype='image/png', as_attachment=False)
 
 
 @app.route('/callback')
