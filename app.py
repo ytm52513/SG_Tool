@@ -332,7 +332,7 @@ def index():
 
 @app.route('/login')
 def login():
-    """核心：扫码入口 - 获取 token 后返回我们的中间页面"""
+    """核心：扫码入口 - 返回中间页面，用 iframe 嵌入支付宝 pcLogin.html"""
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
     debug_log(f"[LOGIN] ========== 新扫码请求 ==========")
     debug_log(f"[LOGIN] 客户端IP: {client_ip}")
@@ -348,93 +348,143 @@ def login():
         debug_log(f"[LOGIN] token 获取成功 (len={len(token)})")
         debug_log(f"[LOGIN] alipay_url: {alipay_url[:200]}")
 
-        # 不直接 302 到支付宝，而是返回一个中间页面
-        # 这个页面会跳转到支付宝，然后监听返回的 token
+        # 提取 pcLogin.html 的 URL（不修改，保持原样）
+        # alipay_url 是: https://render.alipay.com/p/s/ulink?scheme=alipays://...
+        # 我们需要从 scheme 参数中提取 pcLogin.html 的 URL
+        from urllib.parse import parse_qs, unquote
+        parsed = urlparse(alipay_url)
+        query = parse_qs(parsed.query)
+        scheme_val = query.get('scheme', [''])[0]
+
+        pc_login_url = ""
+        if scheme_val:
+            # scheme_val 是 alipays://... 需要再解析
+            decoded_scheme = unquote(scheme_val)
+            debug_log(f"[LOGIN] decoded_scheme: {decoded_scheme[:200]}")
+
+            if 'url=' in decoded_scheme:
+                # 提取 url 参数（这是 pcLogin.html 的地址）
+                url_start = decoded_scheme.find('url=') + 4
+                url_end = decoded_scheme.find('&', url_start)
+                if url_end == -1:
+                    url_end = len(decoded_scheme)
+                pc_login_url = unquote(decoded_scheme[url_start:url_end])
+                debug_log(f"[LOGIN] pc_login_url: {pc_login_url[:200]}")
+
         base = get_base_url()
         debug_log(f"[LOGIN] base_url: {base}")
+
+        if not pc_login_url:
+            debug_log(f"[LOGIN] 无法提取 pc_login_url，直接跳转", "WARN")
+            return redirect(alipay_url, code=302)
 
         return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>登录中...</title>
+    <title>时光杂货店 - 扫码登录</title>
     <script>
-        // 保存服务端获取的登录 token（getLoginToken 返回的 JWT）
-        var loginToken = "{token}";
         var serverBase = "{base}";
+        var loginToken = "{token}";
 
-        console.log("[LOGIN] loginToken (前30):", loginToken.substring(0, 30));
-        console.log("[LOGIN] serverBase:", serverBase);
+        console.log("[LOGIN] 页面加载");
+        console.log("[LOGIN] loginToken:", loginToken.substring(0, 30) + "...");
+        console.log("[LOGIN] pc_login_url: {pc_login_url[:80]}...");
 
-        // 监听来自支付宝页面的 postMessage（pcLogin.html 可能通过 iframe 发送）
+        // 监听 iframe 的 postMessage
         window.addEventListener("message", function(event) {{
             console.log("[POSTMESSAGE] origin:", event.origin);
             console.log("[POSTMESSAGE] data:", JSON.stringify(event.data));
 
-            // 尝试从 event.data 中提取 token
-            var data = event.data;
-            if (typeof data === 'string') {{
-                try {{ data = JSON.parse(data); }} catch(e) {{}}
-            }}
-
-            // 发送到我们的服务器
-            var tokenStr = data.token || data.authCode || data.gameToken ||
-                           data.sessionId || (typeof data === 'string' ? data : '');
-            if (tokenStr) {{
-                fetch(serverBase + "/api/report-token", {{
-                    method: "POST",
-                    headers: {{"Content-Type": "application/json"}},
-                    body: JSON.stringify({{
-                        type: "postmessage",
-                        source: event.origin,
-                        data: data
-                    }})
-                }}).then(r => r.json()).then(j => {{
-                    console.log("[POSTMESSAGE] 已上报服务器:", j);
-                }});
-            }}
+            // 上报到服务器
+            fetch(serverBase + "/api/report-token", {{
+                method: "POST",
+                headers: {{"Content-Type": "application/json"}},
+                body: JSON.stringify({{
+                    type: "postmessage",
+                    origin: event.origin,
+                    data: event.data
+                }})
+            }}).then(r => r.json()).then(j => {{
+                console.log("[POSTMESSAGE] 已上报:", j);
+                if (j.captured) {{
+                    document.getElementById("status").innerHTML =
+                        "<h3 style='color:#28a745'>登录成功！</h3><p>请返回代挂工具查看</p>";
+                }}
+            }});
         }}, false);
 
-        // 也监听 localStorage/sessionStorage 变化（支付宝可能通过 storage 传递 token）
-        var origSetItem = Storage.prototype.setItem;
-        Storage.prototype.setItem = function(key, value) {{
-            console.log("[STORAGE] setItem:", key, "=", String(value).substring(0, 50));
-            origSetItem.call(this, key, value);
-
-            // 如果 key 包含 token 相关关键字，上报
-            var kl = key.toLowerCase();
-            if (kl.indexOf('token') >= 0 || kl.indexOf('auth') >= 0 || kl.indexOf('session') >= 0 ||
-                kl.indexOf('game') >= 0 || kl.indexOf('pcweb') >= 0) {{
-                fetch(serverBase + "/api/report-token", {{
-                    method: "POST",
-                    headers: {{"Content-Type": "application/json"}},
-                    body: JSON.stringify({{
-                        type: "storage_set",
-                        key: key,
-                        value: String(value).substring(0, 500)
-                    }})
-                }});
-            }}
-        }};
-
-        // 跳转到支付宝
-        setTimeout(function() {{
-            window.location.href = "{alipay_url}";
-        }}, 500);
+        // 定期检查 iframe 的 URL（可能包含 token）
+        setInterval(function() {{
+            try {{
+                var iframe = document.getElementById("alipay-frame");
+                if (iframe && iframe.contentWindow) {{
+                    var url = iframe.contentWindow.location.href;
+                    if (url && url.indexOf('token') >= 0) {{
+                        console.log("[IFRAME] URL 变化:", url);
+                        fetch(serverBase + "/api/report-token", {{
+                            method: "POST",
+                            headers: {{"Content-Type": "application/json"}},
+                            body: JSON.stringify({{
+                                type: "iframe_url",
+                                url: url
+                            }})
+                        }});
+                    }}
+                }}
+            }} catch(e) {{}}
+        }}, 2000);
     </script>
     <style>
-        body {{ font-family: sans-serif; background: #667eea; color: white;
-               display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
-        .box {{ text-align: center; }}
-        h2 {{ margin-bottom: 10px; }}
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex; flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }}
+        .container {{
+            background: white; border-radius: 16px;
+            padding: 30px; max-width: 400px; width: 100%;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+        }}
+        h1 {{ color: #667eea; font-size: 20px; margin-bottom: 10px; text-align: center; }}
+        .subtitle {{ color: #999; font-size: 13px; text-align: center; margin-bottom: 20px; }}
+        .iframe-box {{
+            border: 2px solid #e0e0e0; border-radius: 12px;
+            overflow: hidden; height: 500px;
+            background: #f5f5f5;
+        }}
+        iframe {{
+            width: 100%; height: 100%;
+            border: none;
+        }}
+        #status {{
+            margin-top: 15px; padding: 15px;
+            background: #fff3cd; border-radius: 8px;
+            text-align: center; font-size: 14px;
+        }}
+        .tip {{
+            margin-top: 15px; color: #666; font-size: 12px;
+            text-align: center;
+        }}
     </style>
 </head>
 <body>
-    <div class="box">
-        <h2>正在跳转到支付宝...</h2>
-        <p>请确认登录</p>
-        <p style="font-size:12px;opacity:0.7;">token: {token[:30]}...</p>
+    <div class="container">
+        <h1>时光杂货店</h1>
+        <div class="subtitle">请在下方完成支付宝登录</div>
+        <div class="iframe-box">
+            <iframe id="alipay-frame" src="{pc_login_url}" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
+        </div>
+        <div id="status">等待登录...</div>
+        <div class="tip">
+            登录完成后，代挂工具将自动获取授权<br>
+            请勿关闭此页面
+        </div>
     </div>
 </body>
 </html>"""
