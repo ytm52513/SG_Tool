@@ -78,7 +78,7 @@ def get_base_url():
 def fetch_fresh_token_and_url():
     """
     实时获取新的登录 token 和支付宝 URL
-    关键：修改回调 URL 为我们自己的服务器
+    注意：URL修改现在在 /login 路由中处理
     """
     headers = dict(API_HEADERS)
     debug_log(f"[API] 请求 getLoginToken...")
@@ -100,20 +100,8 @@ def fetch_fresh_token_and_url():
             debug_log(f"[API] original_url (前150字符): {original_url[:150]}")
             debug_log(f"[API] original_url 完整长度: {len(original_url)}")
 
-            # 解析 alipays:// URL 中的回调地址
-            callback_url = f"{get_base_url()}/callback"
-            debug_log(f"[API] 目标 callback_url: {callback_url}")
-
-            # 尝试修改回调地址
-            modified_url = _modify_callback_in_url(original_url, callback_url)
-            debug_log(f"[API] modified_url (前200字符): {modified_url[:200]}")
-
-            if modified_url != original_url:
-                debug_log(f"[API] URL 已修改 (回调地址已替换)")
-            else:
-                debug_log(f"[API] !!! WARNING: URL 未被修改! 原始URL格式可能不符合预期")
-
-            return token, modified_url
+            # 不再这里修改URL，返回原始URL，在/login中处理
+            return token, original_url
         else:
             debug_log(f"[API] 请求失败: {data.get('msg', 'unknown')}", "ERROR")
     except Exception as e:
@@ -332,7 +320,10 @@ def index():
 
 @app.route('/login')
 def login():
-    """核心：扫码入口 - 返回中间页面，用 iframe 嵌入支付宝 pcLogin.html"""
+    """
+    扫码入口 - 直接跳转到修改后的支付宝登录页
+    核心：修改pcLogin.html的回调URL为我们的服务器
+    """
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
     debug_log(f"[LOGIN] ========== 新扫码请求 ==========")
     debug_log(f"[LOGIN] 客户端IP: {client_ip}")
@@ -348,15 +339,13 @@ def login():
         debug_log(f"[LOGIN] token 获取成功 (len={len(token)})")
         debug_log(f"[LOGIN] alipay_url: {alipay_url[:200]}")
 
-        # 提取 pcLogin.html 的 URL（不修改，保持原样）
+        # 提取 pcLogin.html 的 URL 并修改其回调参数
         # alipay_url 是: https://render.alipay.com/p/s/ulink?scheme=alipays://...
-        # 我们需要从 scheme 参数中提取 pcLogin.html 的 URL
-        from urllib.parse import parse_qs, unquote
+        from urllib.parse import parse_qs, unquote, quote
         parsed = urlparse(alipay_url)
         query = parse_qs(parsed.query)
         scheme_val = query.get('scheme', [''])[0]
 
-        pc_login_url = ""
         if scheme_val:
             # scheme_val 是 alipays://... 需要再解析
             decoded_scheme = unquote(scheme_val)
@@ -368,129 +357,98 @@ def login():
                 url_end = decoded_scheme.find('&', url_start)
                 if url_end == -1:
                     url_end = len(decoded_scheme)
-                pc_login_url = unquote(decoded_scheme[url_start:url_end])
-                debug_log(f"[LOGIN] pc_login_url: {pc_login_url[:200]}")
+                pc_login_url_encoded = decoded_scheme[url_start:url_end]
+                pc_login_url = unquote(pc_login_url_encoded)
+                debug_log(f"[LOGIN] 原始 pc_login_url: {pc_login_url[:250]}")
 
-        base = get_base_url()
-        debug_log(f"[LOGIN] base_url: {base}")
+                # 修改 pcLogin.html 的回调URL
+                base = get_base_url()
+                our_callback = f"{base}/callback"
+                modified_pc_login_url = _modify_pc_login_callback(pc_login_url, our_callback)
 
-        if not pc_login_url:
-            debug_log(f"[LOGIN] 无法提取 pc_login_url，直接跳转", "WARN")
-            return redirect(alipay_url, code=302)
+                debug_log(f"[LOGIN] 修改后 pc_login_url: {modified_pc_login_url[:250]}")
 
-        return f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>时光杂货店 - 扫码登录</title>
-    <script>
-        var serverBase = "{base}";
-        var loginToken = "{token}";
+                # 重新构建 alipays:// URL
+                new_scheme = decoded_scheme[:url_start] + quote(modified_pc_login_url, safe='') + decoded_scheme[url_end:]
+                debug_log(f"[LOGIN] 新 scheme: {new_scheme[:200]}")
 
-        console.log("[LOGIN] 页面加载");
-        console.log("[LOGIN] loginToken:", loginToken.substring(0, 30) + "...");
-        console.log("[LOGIN] pc_login_url: {pc_login_url[:80]}...");
+                # 重新构建完整的 render.alipay.com URL
+                query['scheme'] = quote(new_scheme, safe='')
+                new_query = urlencode(query)
+                final_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
 
-        // 监听 iframe 的 postMessage
-        window.addEventListener("message", function(event) {{
-            console.log("[POSTMESSAGE] origin:", event.origin);
-            console.log("[POSTMESSAGE] data:", JSON.stringify(event.data));
+                debug_log(f"[LOGIN] 最终跳转URL: {final_url[:200]}")
+                debug_log(f"[LOGIN] 执行302跳转...")
 
-            // 上报到服务器
-            fetch(serverBase + "/api/report-token", {{
-                method: "POST",
-                headers: {{"Content-Type": "application/json"}},
-                body: JSON.stringify({{
-                    type: "postmessage",
-                    origin: event.origin,
-                    data: event.data
-                }})
-            }}).then(r => r.json()).then(j => {{
-                console.log("[POSTMESSAGE] 已上报:", j);
-                if (j.captured) {{
-                    document.getElementById("status").innerHTML =
-                        "<h3 style='color:#28a745'>登录成功！</h3><p>请返回代挂工具查看</p>";
-                }}
-            }});
-        }}, false);
+                return redirect(final_url, code=302)
 
-        // 定期检查 iframe 的 URL（可能包含 token）
-        setInterval(function() {{
-            try {{
-                var iframe = document.getElementById("alipay-frame");
-                if (iframe && iframe.contentWindow) {{
-                    var url = iframe.contentWindow.location.href;
-                    if (url && url.indexOf('token') >= 0) {{
-                        console.log("[IFRAME] URL 变化:", url);
-                        fetch(serverBase + "/api/report-token", {{
-                            method: "POST",
-                            headers: {{"Content-Type": "application/json"}},
-                            body: JSON.stringify({{
-                                type: "iframe_url",
-                                url: url
-                            }})
-                        }});
-                    }}
-                }}
-            }} catch(e) {{}}
-        }}, 2000);
-    </script>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex; flex-direction: column;
-            align-items: center;
-            padding: 20px;
-        }}
-        .container {{
-            background: white; border-radius: 16px;
-            padding: 30px; max-width: 400px; width: 100%;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
-        }}
-        h1 {{ color: #667eea; font-size: 20px; margin-bottom: 10px; text-align: center; }}
-        .subtitle {{ color: #999; font-size: 13px; text-align: center; margin-bottom: 20px; }}
-        .iframe-box {{
-            border: 2px solid #e0e0e0; border-radius: 12px;
-            overflow: hidden; height: 500px;
-            background: #f5f5f5;
-        }}
-        iframe {{
-            width: 100%; height: 100%;
-            border: none;
-        }}
-        #status {{
-            margin-top: 15px; padding: 15px;
-            background: #fff3cd; border-radius: 8px;
-            text-align: center; font-size: 14px;
-        }}
-        .tip {{
-            margin-top: 15px; color: #666; font-size: 12px;
-            text-align: center;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>时光杂货店</h1>
-        <div class="subtitle">请在下方完成支付宝登录</div>
-        <div class="iframe-box">
-            <iframe id="alipay-frame" src="{pc_login_url}" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
-        </div>
-        <div id="status">等待登录...</div>
-        <div class="tip">
-            登录完成后，代挂工具将自动获取授权<br>
-            请勿关闭此页面
-        </div>
-    </div>
-</body>
-</html>"""
+        # 如果解析失败，直接跳转原始URL
+        debug_log(f"[LOGIN] 无法解析URL结构，使用原始跳转", "WARN")
+        return redirect(alipay_url, code=302)
     else:
         debug_log(f"[LOGIN] FAILED: 无法获取 token", "ERROR")
         return Response("Server error, please try again later", status=503)
+
+
+def _modify_pc_login_callback(pc_login_url: str, new_callback: str) -> str:
+    """
+    修改 pcLogin.html URL 中的回调地址
+    pcLogin.html URL 结构:
+    https://render.alipay.com/p/yuyan/180020010001270314/0.2.2304261138.43/pcLogin.html
+        ?appId=2021003129681023
+        &source=pcWeb
+        &url=https%3A%2F%2Fwww.wanyiwan.top%2Falipay%2Fcallback%3F...
+    """
+    from urllib.parse import urlparse, parse_qs, urlencode
+
+    debug_log(f"[MOD_PC] 原始URL: {pc_login_url[:200]}")
+    debug_log(f"[MOD_PC] 新callback: {new_callback}")
+
+    parsed = urlparse(pc_login_url)
+    params = parse_qs(parsed.query)
+
+    debug_log(f"[MOD_PC] 参数: {list(params.keys())}")
+
+    # 修改 url 参数（这是支付宝授权后的回调地址）
+    if 'url' in params:
+        old_url = params['url'][0] if isinstance(params['url'], list) else params['url']
+        debug_log(f"[MOD_PC] 原url参数: {old_url[:150]}")
+
+        # 解析原url，保留其中的其他参数（如token）
+        old_parsed = urlparse(old_url)
+        old_params = parse_qs(old_parsed.query)
+        debug_log(f"[MOD_PC] 原url参数: {list(old_params.keys())}")
+
+        # 构建新的回调URL，保留原参数
+        new_parsed = urlparse(new_callback)
+        new_params = parse_qs(new_parsed.query)
+
+        # 合并参数：保留原url中的参数，但替换host和path
+        merged_params = dict(old_params)
+        merged_params.update(new_params)
+
+        # 构建新的完整回调URL
+        new_callback_with_params = f"{new_callback}"
+        if merged_params:
+            if '?' not in new_callback_with_params:
+                new_callback_with_params += '?'
+            else:
+                new_callback_with_params += '&'
+            new_callback_with_params += urlencode(merged_params, doseq=True)
+
+        params['url'] = new_callback_with_params
+        debug_log(f"[MOD_PC] 新url参数: {new_callback_with_params[:150]}")
+    else:
+        # 如果没有url参数，直接添加
+        params['url'] = new_callback
+        debug_log(f"[MOD_PC] 添加url参数")
+
+    # 重建URL
+    new_query = urlencode(params, doseq=True)
+    result = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+
+    debug_log(f"[MOD_PC] 结果: {result[:200]}")
+    return result
 
 
 @app.route('/callback')
