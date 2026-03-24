@@ -89,13 +89,16 @@ def get_base_url():
 @app.route('/')
 def index():
     """首页 - 展示二维码"""
+    base = get_base_url()
+    login_url = f"{base}/login"
+    # 用 Google Chart API 生成二维码图片URL（无需任何前端库）
+    qr_img_url = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={login_url}"
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{config['site_title']} - 扫码登录</title>
-    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
@@ -124,13 +127,24 @@ def index():
             border-radius: 12px;
             padding: 20px;
             margin: 20px 0;
-            display: flex;
+            display: inline-block;
+        }}
+        .qr-box img {{
+            width: 250px;
+            height: 250px;
+            display: block;
+        }}
+        .qr-fallback {{
+            width: 250px;
+            height: 250px;
+            display: none;
             justify-content: center;
             align-items: center;
-            min-height: 250px;
+            background: #eee;
+            border-radius: 8px;
+            font-size: 14px;
+            color: #666;
         }}
-        .qr-box img {{ max-width: 220px; }}
-        .qr-box canvas {{ max-width: 220px; }}
         .tip {{
             background: #fff3cd;
             border: 1px solid #ffc107;
@@ -151,7 +165,17 @@ def index():
         }}
         .stats {{ color: #999; font-size: 12px; margin-top: 15px; }}
         .footer {{ color: rgba(255,255,255,0.6); font-size: 12px; margin-top: 30px; }}
-        .loading {{ color: #999; font-size: 14px; }}
+        .url-link {{
+            display: inline-block;
+            margin-top: 10px;
+            padding: 8px 16px;
+            background: #667eea;
+            color: white;
+            border-radius: 8px;
+            text-decoration: none;
+            font-size: 13px;
+        }}
+        .url-link:hover {{ background: #764ba2; }}
     </style>
 </head>
 <body>
@@ -160,27 +184,20 @@ def index():
         <div class="subtitle">支付宝扫码登录</div>
         <span class="badge">本码永久有效</span>
         <div class="qr-box">
-            <div id="qrcode" class="loading">加载中...</div>
+            <img src="{qr_img_url}" alt="登录二维码" 
+                 onerror="this.style.display='none';document.getElementById('fallback').style.display='flex';">
+            <div id="fallback" class="qr-fallback">
+                二维码加载失败<br>请点击下方链接
+            </div>
         </div>
         <div class="tip">
             打开支付宝 App 扫描二维码<br>
             确认后自动登录游戏
         </div>
-        <div class="stats">已扫码 <span id="scanCount">0</span> 次</div>
+        <a href="{login_url}" class="url-link">点击直接跳转登录</a>
+        <div class="stats">已扫码 {config['scan_count']} 次</div>
     </div>
     <div class="footer">Powered by Cloud Server</div>
-    <script>
-        // 生成二维码：指向当前域名的 /login 路径
-        const loginUrl = window.location.origin + '/login';
-        new QRCode(document.getElementById('qrcode'), {{
-            text: loginUrl,
-            width: 220,
-            height: 220,
-            colorDark: '#000000',
-            colorLight: '#ffffff',
-            correctLevel: QRCode.CorrectLevel.M
-        }});
-    </script>
 </body>
 </html>"""
 
