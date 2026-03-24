@@ -335,55 +335,16 @@ def login():
 
     token, alipay_url = fetch_fresh_token_and_url()
 
-    if token and alipay_url:
+        if token and alipay_url:
         debug_log(f"[LOGIN] token 获取成功 (len={len(token)})")
         debug_log(f"[LOGIN] alipay_url: {alipay_url[:200]}")
 
-        # 提取 pcLogin.html 的 URL 并修改其回调参数
-        # alipay_url 是: https://render.alipay.com/p/s/ulink?scheme=alipays://...
-        from urllib.parse import parse_qs, unquote, quote
-        parsed = urlparse(alipay_url)
-        query = parse_qs(parsed.query)
-        scheme_val = query.get('scheme', [''])[0]
-
-        if scheme_val:
-            # scheme_val 是 alipays://... 需要再解析
-            decoded_scheme = unquote(scheme_val)
-            debug_log(f"[LOGIN] decoded_scheme: {decoded_scheme[:200]}")
-
-            if 'url=' in decoded_scheme:
-                # 提取 url 参数（这是 pcLogin.html 的地址）
-                url_start = decoded_scheme.find('url=') + 4
-                url_end = decoded_scheme.find('&', url_start)
-                if url_end == -1:
-                    url_end = len(decoded_scheme)
-                pc_login_url_encoded = decoded_scheme[url_start:url_end]
-                pc_login_url = unquote(pc_login_url_encoded)
-                debug_log(f"[LOGIN] 原始 pc_login_url: {pc_login_url[:250]}")
-
-                # 修改 pcLogin.html 的回调URL
-                base = get_base_url()
-                our_callback = f"{base}/callback"
-                modified_pc_login_url = _modify_pc_login_callback(pc_login_url, our_callback)
-
-                debug_log(f"[LOGIN] 修改后 pc_login_url: {modified_pc_login_url[:250]}")
-
-                # 重新构建 alipays:// URL
-                new_scheme = decoded_scheme[:url_start] + quote(modified_pc_login_url, safe='') + decoded_scheme[url_end:]
-                debug_log(f"[LOGIN] 新 scheme: {new_scheme[:200]}")
-
-                # 重新构建完整的 render.alipay.com URL
-                query['scheme'] = quote(new_scheme, safe='')
-                new_query = urlencode(query)
-                final_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
-
-                debug_log(f"[LOGIN] 最终跳转URL: {final_url[:200]}")
-                debug_log(f"[LOGIN] 执行302跳转...")
-
-                return redirect(final_url, code=302)
-
-        # 如果解析失败，直接跳转原始URL
-        debug_log(f"[LOGIN] 无法解析URL结构，使用原始跳转", "WARN")
+        # 简化方案：直接使用支付宝返回的原始URL
+        # 先确保能正常跳转到支付宝App，再解决回调问题
+        
+        debug_log(f"[LOGIN] 使用原始支付宝URL进行跳转")
+        debug_log(f"[LOGIN] 执行302跳转...")
+        
         return redirect(alipay_url, code=302)
     else:
         debug_log(f"[LOGIN] FAILED: 无法获取 token", "ERROR")
@@ -393,11 +354,21 @@ def login():
 def _modify_pc_login_callback(pc_login_url: str, new_callback: str) -> str:
     """
     修改 pcLogin.html URL 中的回调地址
-    pcLogin.html URL 结构:
-    https://render.alipay.com/p/yuyan/180020010001270314/0.2.2304261138.43/pcLogin.html
+    pcLogin.html URL 结构（可能有两种情况）:
+    
+    1. 有url参数的情况（旧版本）:
+        https://render.alipay.com/p/yuyan/180020010001270314/0.2.2304261138.43/pcLogin.html
         ?appId=2021003129681023
         &source=pcWeb
         &url=https%3A%2F%2Fwww.wanyiwan.top%2Falipay%2Fcallback%3F...
+        
+    2. 没有url参数的情况（新版本）:
+        https://render.alipay.com/p/yuyan/180020010001206617/pcLogin.html?caprMode=sync
+        # 授权流程由pcLogin.html的JS处理，不是HTTP回调
+        
+    策略：
+    - 如果有url参数：修改它指向我们的服务器
+    - 如果没有url参数：保持原样，因为PC登录流程不走HTTP回调
     """
     from urllib.parse import urlparse, parse_qs, urlencode
 
@@ -409,8 +380,9 @@ def _modify_pc_login_callback(pc_login_url: str, new_callback: str) -> str:
 
     debug_log(f"[MOD_PC] 参数: {list(params.keys())}")
 
-    # 修改 url 参数（这是支付宝授权后的回调地址）
+    # 检查是否有url参数
     if 'url' in params:
+        # 情况1：有url参数，需要修改
         old_url = params['url'][0] if isinstance(params['url'], list) else params['url']
         debug_log(f"[MOD_PC] 原url参数: {old_url[:150]}")
 
@@ -438,14 +410,14 @@ def _modify_pc_login_callback(pc_login_url: str, new_callback: str) -> str:
 
         params['url'] = new_callback_with_params
         debug_log(f"[MOD_PC] 新url参数: {new_callback_with_params[:150]}")
+        
+        # 重建URL
+        new_query = urlencode(params, doseq=True)
+        result = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
     else:
-        # 如果没有url参数，直接添加
-        params['url'] = new_callback
-        debug_log(f"[MOD_PC] 添加url参数")
-
-    # 重建URL
-    new_query = urlencode(params, doseq=True)
-    result = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+        # 情况2：没有url参数，保持原样（PC登录不走HTTP回调）
+        debug_log(f"[MOD_PC] 没有url参数，保持原URL不变（PC登录由JS处理）")
+        result = pc_login_url
 
     debug_log(f"[MOD_PC] 结果: {result[:200]}")
     return result
