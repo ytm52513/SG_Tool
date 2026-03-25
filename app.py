@@ -329,14 +329,102 @@ def index():
 </html>"""
 
 
+def _poll_for_authcode(session_token: str, server_id: str):
+    """
+    后台线程：用 session_token 轮询 loginForPc，等手机扫码授权成功，
+    再调 queryPcGameAuthInfo 拿 authCode，存入全局 authcodes 列表。
+    
+    抓包确认的真实流程：
+      1. loginForPc (轮询，带 session_token) → 成功后返回 userId + 新 token
+      2. queryPcGameAuthInfo (appId=2021004170660258) → 返回 authCode
+    """
+    LOGIN_FOR_PC_URL = (
+        "https://webgwmobiler.alipay.com/gameauth/com.alipay.gameauth.common.facade"
+        ".service.GameCenterPcAuthFacade/loginForPc"
+        "?ctoken=bigfish_ctoken_1a76c5jk1b"
+    )
+    AUTH_INFO_URL = (
+        "https://webgwmobiler.alipay.com/gamecenterhome/com.alipay.gamecenterhome"
+        ".common.facade.service.GameCenterPcGameFacade/queryPcGameAuthInfo"
+        "/uprodhatchstation66500008?ctoken=bigfish_ctoken_1a76c5jk1b"
+    )
+    APP_ID = "2021004170660258"  # 时光杂货店 appId（从抓包确认）
+
+    max_polls = 60   # 最多等 ~3 分钟（每次3秒）
+    poll_interval = 3
+
+    headers = dict(API_HEADERS)
+
+    debug_log(f"[POLL] 开始轮询 loginForPc，session_token={session_token[:20]}...")
+
+    for attempt in range(max_polls):
+        time.sleep(poll_interval)
+        try:
+            headers['x-game-token-pcweb'] = session_token
+            resp = requests.post(
+                LOGIN_FOR_PC_URL,
+                headers=headers,
+                json={"token": session_token},
+                timeout=10
+            )
+            data = resp.json()
+            if data.get('success') and data.get('data'):
+                user_id = data['data'].get('userId', '')
+                new_token = data['data'].get('token', session_token)
+                debug_log(f"[POLL] ✅ 扫码成功! userId={user_id}，获取 authCode...")
+
+                # 拿 authCode
+                headers['x-game-token-pcweb'] = new_token
+                auth_resp = requests.post(
+                    AUTH_INFO_URL,
+                    headers=headers,
+                    json={"appId": APP_ID},
+                    timeout=10
+                )
+                auth_data = auth_resp.json()
+                if auth_data.get('success') and auth_data.get('data'):
+                    auth_code = auth_data['data'].get('authCode', '')
+                    if auth_code:
+                        entry = {
+                            'time':     __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            'ip':       'alipay-pc-poll',
+                            'authCode': auth_code,
+                            'serverId': server_id,
+                            'params':   {'authCode': auth_code, 'server': server_id},
+                            'url':      '',
+                            'form':     {},
+                        }
+                        with lock:
+                            authcodes.append(entry)
+                        debug_log(f"[POLL] ✅ authCode 已存储! code={auth_code[:20]}... serverId={server_id or '未指定'}")
+                        return
+                    else:
+                        debug_log(f"[POLL] ❌ queryPcGameAuthInfo 未返回 authCode: {auth_data}", "ERROR")
+                        return
+                else:
+                    debug_log(f"[POLL] ❌ queryPcGameAuthInfo 失败: {auth_data}", "ERROR")
+                    return
+            else:
+                # 用户未扫码，继续等待
+                if attempt % 5 == 0:
+                    debug_log(f"[POLL] 等待扫码... attempt={attempt+1}/{max_polls}")
+        except Exception as e:
+            debug_log(f"[POLL] 异常: {e}", "WARN")
+
+    debug_log(f"[POLL] 超时（{max_polls * poll_interval}秒），停止等待", "WARN")
+
+
 @app.route('/login')
 def login():
     """
-    扫码入口 - 直接跳转到修改后的支付宝登录页
-    支持 ?server=4000104 参数，会带到回调 URL 中供本地工具识别区服
+    扫码入口：
+      1. 调 getLoginToken 拿到 sessionToken + 支付宝二维码 URL
+      2. 302 跳转原始支付宝 URL（手机扫码）
+      3. 后台线程用 sessionToken 轮询 loginForPc，扫码成功后自动拿 authCode
+    注意：不修改支付宝 URL，修改会导致支付宝 App 无法识别！
     """
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-    server_id = request.args.get('server', '')  # 区服 ID（可选）
+    server_id = request.args.get('server', '')
 
     debug_log(f"[LOGIN] ========== 新扫码请求 ==========")
     debug_log(f"[LOGIN] 客户端IP: {client_ip}")
@@ -350,10 +438,19 @@ def login():
 
     if token and alipay_url:
         debug_log(f"[LOGIN] token 获取成功 (len={len(token)})")
-        debug_log(f"[LOGIN] 使用原始支付宝URL进行跳转")
-        debug_log(f"[LOGIN] 执行302跳转...")
+        debug_log(f"[LOGIN] 启动后台轮询线程...")
 
+        # 后台线程轮询等待扫码
+        t = threading.Thread(
+            target=_poll_for_authcode,
+            args=(token, server_id),
+            daemon=True
+        )
+        t.start()
+
+        debug_log(f"[LOGIN] 执行302跳转（原始URL，不修改）...")
         return redirect(alipay_url, code=302)
+
     else:
         debug_log(f"[LOGIN] FAILED: 无法获取 token", "ERROR")
         return Response("Server error, please try later", status=503)
