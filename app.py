@@ -239,10 +239,15 @@ def log_all_requests():
 
 @app.route('/')
 def index():
-    """首页 - 展示二维码"""
+    """首页 - 展示二维码（支持 ?server=4000104 指定区服）"""
     base = get_base_url()
-    login_url = f"{base}/login"
-    qr_img_url = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={login_url}"
+    # 支持 URL 参数传入 serverId（方便不同区服的用户用不同链接）
+    server_id = request.args.get('server', '')
+    login_path = f"/login?server={server_id}" if server_id else "/login"
+    login_url = f"{base}{login_path}"
+    qr_img_url = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={requests.utils.quote(login_url)}"
+
+    server_hint = f"（区服 {server_id}）" if server_id else ""
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -267,6 +272,11 @@ def index():
         }}
         h1 {{ color: #667eea; margin-bottom: 10px; font-size: 24px; }}
         .subtitle {{ color: #999; margin-bottom: 30px; font-size: 14px; }}
+        .server-tag {{
+            background: #e8f0fe; color: #1a73e8;
+            padding: 2px 10px; border-radius: 12px;
+            font-size: 12px; display: inline-block; margin-bottom: 15px;
+        }}
         .qr-box {{
             background: #f8f9fa; border-radius: 12px;
             padding: 20px; display: inline-block;
@@ -299,7 +309,8 @@ def index():
 <body>
     <div class="container">
         <h1>{config['site_title']}</h1>
-        <div class="subtitle">代挂工具 - 支付宝扫码</div>
+        <div class="subtitle">代挂工具 - 支付宝扫码 {server_hint}</div>
+        {'<span class="server-tag">区服 ' + server_id + '</span>' if server_id else ''}
         <span class="badge">实时二维码</span>
         <div class="qr-box">
             <img src="{qr_img_url}" alt="登录二维码">
@@ -322,13 +333,15 @@ def index():
 def login():
     """
     扫码入口 - 直接跳转到修改后的支付宝登录页
-    核心：修改pcLogin.html的回调URL为我们的服务器
+    支持 ?server=4000104 参数，会带到回调 URL 中供本地工具识别区服
     """
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+    server_id = request.args.get('server', '')  # 区服 ID（可选）
+
     debug_log(f"[LOGIN] ========== 新扫码请求 ==========")
     debug_log(f"[LOGIN] 客户端IP: {client_ip}")
+    debug_log(f"[LOGIN] server_id: {server_id or '未指定'}")
     debug_log(f"[LOGIN] User-Agent: {request.headers.get('User-Agent', 'N/A')[:100]}")
-    debug_log(f"[LOGIN] Referer: {request.headers.get('Referer', 'N/A')}")
 
     with lock:
         config["scan_count"] += 1
@@ -337,12 +350,9 @@ def login():
 
     if token and alipay_url:
         debug_log(f"[LOGIN] token 获取成功 (len={len(token)})")
-        debug_log(f"[LOGIN] alipay_url: {alipay_url[:200]}")
-
-        # 保持支付宝URL原样，直接跳转
         debug_log(f"[LOGIN] 使用原始支付宝URL进行跳转")
         debug_log(f"[LOGIN] 执行302跳转...")
-        
+
         return redirect(alipay_url, code=302)
     else:
         debug_log(f"[LOGIN] FAILED: 无法获取 token", "ERROR")
@@ -425,71 +435,66 @@ def _modify_pc_login_callback(pc_login_url: str, new_callback: str) -> str:
 def callback():
     """
     支付宝扫码确认后的回调
-    捕获 authCode 并保存
+    捕获 authCode 并保存，支持 server 参数（区服ID）透传
     """
     params = dict(request.args)
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
 
     debug_log(f"[CALLBACK] ========== 收到回调 ==========")
     debug_log(f"[CALLBACK] IP: {client_ip}")
-    debug_log(f"[CALLBACK] 方法: {request.method}")
     debug_log(f"[CALLBACK] 完整URL: {request.url}")
-    debug_log(f"[CALLBACK] Content-Type: {request.headers.get('Content-Type', 'N/A')}")
-    debug_log(f"[CALLBACK] User-Agent: {request.headers.get('User-Agent', 'N/A')[:100]}")
-    debug_log(f"[CALLBACK] Referer: {request.headers.get('Referer', 'N/A')}")
 
     # 打印所有 query 参数
     debug_log(f"[CALLBACK] Query 参数 ({len(params)} 个):")
     for k, v in params.items():
         debug_log(f"[CALLBACK]   {k} = {str(v)[:200]}")
 
-    # 如果有 POST body 也打印
-    if request.method == 'POST':
-        debug_log(f"[CALLBACK] POST body: {request.get_data(as_text=True)[:500]}")
-
-    # 检查 request.form
+    # 检查 POST body
     form_data = dict(request.form)
     if form_data:
         debug_log(f"[CALLBACK] Form 数据 ({len(form_data)} 个):")
         for k, v in form_data.items():
             debug_log(f"[CALLBACK]   form[{k}] = {str(v)[:200]}")
 
-    # 尝试从多个可能的参数名中提取 authCode
+    # 提取 authCode
     auth_code = None
     for key_name in ['authCode', 'code', 'auth_code', 'token', 'authToken']:
         val = params.get(key_name)
         if val:
             auth_code = val[0] if isinstance(val, list) else val
             if auth_code:
-                debug_log(f"[CALLBACK] 从 '{key_name}' 找到 authCode: {auth_code[:20]}... (len={len(auth_code)})")
+                debug_log(f"[CALLBACK] 从 query['{key_name}'] 找到 authCode (len={len(auth_code)})")
                 break
-
     if not auth_code:
-        # 也检查 form data
         for key_name in ['authCode', 'code', 'auth_code', 'token', 'authToken']:
             val = form_data.get(key_name)
             if val:
-                auth_code = str(val)
-                debug_log(f"[CALLBACK] 从 form '{key_name}' 找到 authCode: {auth_code[:20]}... (len={len(auth_code)})")
+                auth_code = str(val[0] if isinstance(val, list) else val)
+                debug_log(f"[CALLBACK] 从 form['{key_name}'] 找到 authCode (len={len(auth_code)})")
                 break
 
+    # 提取 serverId（如果回调 URL 携带了）
+    server_id = params.get('server', '') or params.get('serverId', '') or ''
+    if isinstance(server_id, list):
+        server_id = server_id[0] if server_id else ''
+
     entry = {
-        'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'ip': client_ip,
+        'time':     datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'ip':       client_ip,
         'authCode': auth_code,
-        'params': params,
-        'url': request.url,
-        'form': form_data,
+        'serverId': server_id,   # 区服 ID（可能为空）
+        'params':   params,
+        'url':      request.url,
+        'form':     form_data,
     }
 
     with lock:
         authcodes.append(entry)
 
     if auth_code:
-        debug_log(f"[CALLBACK] 成功获取 authCode!")
+        debug_log(f"[CALLBACK] ✅ 成功获取 authCode! serverId={server_id or '未指定'}")
     else:
-        debug_log(f"[CALLBACK] !!! 未找到 authCode !!! 所有参数已记录", "WARN")
-        debug_log(f"[CALLBACK] 提示: 支付宝可能没有回调到此URL，请检查 alipays:// 链接中的回调配置", "WARN")
+        debug_log(f"[CALLBACK] ⚠ 未找到 authCode，所有参数已记录", "WARN")
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -512,7 +517,7 @@ def callback():
 </head>
 <body>
     <div class="box">
-        <h1>{"登录成功" if auth_code else "已收到回调"}</h1>
+        <h1>{"登录成功 ✓" if auth_code else "已收到回调"}</h1>
         <p>代挂工具正在处理中，请稍候...</p>
         <p style="color:#999;font-size:12px;">你可以关闭此页面</p>
     </div>
