@@ -389,6 +389,7 @@ def _poll_for_authcode(session_token: str, server_id: str):
                             'time':     __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                             'ip':       'alipay-pc-poll',
                             'authCode': auth_code,
+                            'aliUserId': str(user_id),   # 支付宝 userId，用于去重
                             'serverId': server_id,
                             'params':   {'authCode': auth_code, 'server': server_id},
                             'url':      '',
@@ -396,7 +397,7 @@ def _poll_for_authcode(session_token: str, server_id: str):
                         }
                         with lock:
                             authcodes.append(entry)
-                        debug_log(f"[POLL] ✅ authCode 已存储! code={auth_code[:20]}... serverId={server_id or '未指定'}")
+                        debug_log(f"[POLL] ✅ authCode 已存储! userId={user_id} code={auth_code[:20]}... serverId={server_id or '未指定'}")
                         return
                     else:
                         debug_log(f"[POLL] ❌ queryPcGameAuthInfo 未返回 authCode: {auth_data}", "ERROR")
