@@ -15,6 +15,8 @@
 import os
 import json
 import time
+import hashlib
+import base64
 import threading
 from datetime import datetime
 
@@ -42,6 +44,72 @@ API_HEADERS = {
     'x-webgw-ldc-uid': '61',
     'x-webgw-version': '2.0'
 }
+
+# ==================== ptoken 兑换（服务端直接完成，避免 authCode 过期）====================
+PTOKEN_URL   = "https://pvt-api.8rn4u.com/h5verify/ptoken"
+PTOKEN_SIGN_KEY = "Jp*4Y8vQOYck2*&Z"
+PTOKEN_GID   = "1021669"
+PTOKEN_PID   = "783"
+PTOKEN_OS    = "android"
+PTOKEN_VER   = "4.5.22"
+
+
+def _ptoken_sign(params: dict) -> str:
+    """ptoken 接口签名：key 排序后 key=val 直接拼接（无分隔符）+ 密钥，MD5"""
+    sorted_str = "".join(f"{k}={v}" for k, v in sorted(params.items()) if v != "")
+    return hashlib.md5((sorted_str + PTOKEN_SIGN_KEY).encode()).hexdigest()
+
+
+def exchange_authcode_to_token(auth_code: str) -> dict | None:
+    """
+    用 authCode 立刻换取游戏 token（在服务端完成，避免本地轮询延迟导致 authCode 过期）。
+    返回: {'game_token': 'BASE64...', 'openid': '3125875535'}
+    失败返回 None。
+    """
+    ts = int(time.time())
+    pdata = json.dumps({
+        "code": auth_code,
+        "path": {"cid": "0", "num": "0"},
+        "scene": "",
+        "platform": "Android"
+    }, separators=(',', ':'))
+    trans_info = base64.b64encode(b'{"cid":"0","num":"0"}').decode()
+    device_id = "railway-server-automate"
+
+    params = {
+        "dev":        device_id,
+        "gid":        PTOKEN_GID,
+        "os":         PTOKEN_OS,
+        "pdata":      pdata,
+        "pid":        PTOKEN_PID,
+        "ptoken":     str(ts),
+        "refer":      f"{PTOKEN_PID}_{PTOKEN_GID}_0_0",
+        "sversion":   PTOKEN_VER,
+        "time":       str(ts),
+        "trans_info": trans_info,
+        "version":    PTOKEN_VER,
+    }
+    params["sign"] = _ptoken_sign(params)
+
+    try:
+        resp = requests.get(
+            PTOKEN_URL, params=params,
+            headers={'user-agent': 'Mozilla/5.0 AlipayMiniApp'},
+            timeout=10
+        )
+        data = resp.json()
+        debug_log(f"[PTOKEN] state={data.get('state')} msg={data.get('msg','')}")
+        if data.get('state') == 1:
+            d = data.get('data', {})
+            token  = d.get('token', '')
+            openid = str(d.get('openid') or d.get('puid', ''))
+            if token:
+                return {'game_token': token, 'openid': openid}
+        debug_log(f"[PTOKEN] 失败: {data}", "ERROR")
+        return None
+    except Exception as e:
+        debug_log(f"[PTOKEN] 异常: {e}", "ERROR")
+        return None
 
 config = {
     "admin_password": ADMIN_PASSWORD,
@@ -385,19 +453,42 @@ def _poll_for_authcode(session_token: str, server_id: str):
                 if auth_data.get('success') and auth_data.get('data'):
                     auth_code = auth_data['data'].get('authCode', '')
                     if auth_code:
-                        entry = {
-                            'time':     __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                            'ip':       'alipay-pc-poll',
-                            'authCode': auth_code,
-                            'aliUserId': str(user_id),   # 支付宝 userId，用于去重
-                            'serverId': server_id,
-                            'params':   {'authCode': auth_code, 'server': server_id},
-                            'url':      '',
-                            'form':     {},
-                        }
-                        with lock:
-                            authcodes.append(entry)
-                        debug_log(f"[POLL] ✅ authCode 已存储! userId={user_id} code={auth_code[:20]}... serverId={server_id or '未指定'}")
+                        debug_log(f"[POLL] authCode 获取成功，立刻兑换 ptoken（避免过期）...")
+                        # ★ 关键修复：在服务端立刻兑换，不等本地轮询
+                        tok_data = exchange_authcode_to_token(auth_code)
+                        if tok_data:
+                            entry = {
+                                'time':       __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'ip':         'alipay-pc-poll',
+                                'authCode':   auth_code,      # 保留原始（兼容旧逻辑）
+                                'game_token': tok_data['game_token'],  # ★ 已兑换的游戏 token
+                                'openid':     tok_data['openid'],       # ★ 游戏 openId
+                                'aliUserId':  str(user_id),
+                                'serverId':   server_id,
+                                'params':     {'authCode': auth_code, 'server': server_id},
+                                'url':        '',
+                                'form':       {},
+                            }
+                            with lock:
+                                authcodes.append(entry)
+                            debug_log(f"[POLL] ✅ token 兑换成功并存储! userId={user_id} openid={tok_data['openid']} serverId={server_id or '未指定'}")
+                        else:
+                            # ptoken 失败：仍然存入 authCode，让本地端尝试（可能已过期，但留个记录）
+                            debug_log(f"[POLL] ⚠ ptoken 兑换失败，仍存入原始 authCode（本地端可能失败）", "WARN")
+                            entry = {
+                                'time':       __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'ip':         'alipay-pc-poll',
+                                'authCode':   auth_code,
+                                'game_token': '',   # 空：本地端需自行兑换
+                                'openid':     '',
+                                'aliUserId':  str(user_id),
+                                'serverId':   server_id,
+                                'params':     {'authCode': auth_code, 'server': server_id},
+                                'url':        '',
+                                'form':       {},
+                            }
+                            with lock:
+                                authcodes.append(entry)
                         return
                     else:
                         debug_log(f"[POLL] ❌ queryPcGameAuthInfo 未返回 authCode: {auth_data}", "ERROR")
