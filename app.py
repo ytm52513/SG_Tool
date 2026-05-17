@@ -18,6 +18,7 @@ import time
 import hashlib
 import base64
 import threading
+import tempfile
 from datetime import datetime
 
 import requests
@@ -120,6 +121,131 @@ config = {
 # 收集的 authCode 列表
 authcodes = []  # [{'authCode': '...', 'time': '...', 'ip': '...'}]
 lock = threading.Lock()
+authcode_changed = threading.Condition(lock)
+AUTHCODE_STORE_PATH = os.environ.get(
+    "AUTHCODE_STORE_PATH",
+    os.path.join(os.path.dirname(__file__), "data", "authcodes.json"),
+)
+_next_authcode_id = 1
+
+
+def _to_int(value, default=0):
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _save_authcodes_locked():
+    """Persist cloud login records. Caller must hold lock/authcode_changed."""
+    os.makedirs(os.path.dirname(AUTHCODE_STORE_PATH), exist_ok=True)
+    payload = {
+        "next_id": _next_authcode_id,
+        "authcodes": authcodes,
+    }
+    fd, tmp_path = tempfile.mkstemp(
+        prefix="authcodes.",
+        suffix=".tmp",
+        dir=os.path.dirname(AUTHCODE_STORE_PATH),
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp_path, AUTHCODE_STORE_PATH)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _load_authcodes_from_disk():
+    """Load persisted records at boot. Render needs a persistent disk for restarts."""
+    global _next_authcode_id
+    if not os.path.exists(AUTHCODE_STORE_PATH):
+        return
+    try:
+        with open(AUTHCODE_STORE_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            rows = payload.get("authcodes", [])
+            saved_next_id = payload.get("next_id")
+        elif isinstance(payload, list):
+            rows = payload
+            saved_next_id = 0
+        else:
+            rows = []
+            saved_next_id = 0
+        if not isinstance(rows, list):
+            rows = []
+        with lock:
+            authcodes.clear()
+            max_id = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                rid = _to_int(row.get("id"), 0)
+                if rid <= 0:
+                    rid = max_id + 1
+                    row["id"] = rid
+                max_id = max(max_id, rid)
+                authcodes.append(row)
+            _next_authcode_id = max(_to_int(saved_next_id, 0), max_id + 1, 1)
+    except Exception as e:
+        print(f"[WARN] load authcode store failed: {e}")
+
+
+def _add_authcode(entry: dict) -> dict:
+    """Append one cloud login record, assign id, persist, and wake long-poll clients."""
+    global _next_authcode_id
+    with authcode_changed:
+        openid = str(entry.get("openid", "") or "").strip()
+        if openid:
+            authcodes[:] = [
+                row for row in authcodes
+                if str(row.get("openid", "") or "").strip() != openid
+            ]
+        if not entry.get("id"):
+            entry["id"] = _next_authcode_id
+            _next_authcode_id += 1
+        authcodes.append(entry)
+        _save_authcodes_locked()
+        authcode_changed.notify_all()
+        return entry
+
+
+def _delete_authcode_locked(record_id: int) -> dict | None:
+    """Delete by persistent id."""
+    for i, row in enumerate(authcodes):
+        if _to_int(row.get("id"), -1) == record_id:
+            return authcodes.pop(i)
+    return None
+
+
+def _entry_matches(row: dict, openid: str = "", since_id: int = 0) -> bool:
+    if since_id and _to_int(row.get("id"), 0) <= since_id:
+        return False
+    if openid and str(row.get("openid", "") or "").strip() != openid:
+        return False
+    return True
+
+
+def _compact_authcode(row: dict) -> dict:
+    """Small payload for list/heartbeat views; token can be fetched by openid when needed."""
+    return {
+        "id": row.get("id"),
+        "time": row.get("time", ""),
+        "openid": row.get("openid", ""),
+        "aliUserId": row.get("aliUserId", ""),
+        "serverId": row.get("serverId", ""),
+        "has_game_token": bool(row.get("game_token") or row.get("token")),
+        "has_authCode": bool(row.get("authCode") or row.get("auth_code")),
+    }
+
+
+_load_authcodes_from_disk()
 
 # ==================== 调试日志 ====================
 # 内存中的调试日志（最多保留200条）
@@ -469,8 +595,7 @@ def _poll_for_authcode(session_token: str, server_id: str):
                                 'url':        '',
                                 'form':       {},
                             }
-                            with lock:
-                                authcodes.append(entry)
+                            _add_authcode(entry)
                             debug_log(f"[POLL] ✅ token 兑换成功并存储! userId={user_id} openid={tok_data['openid']} serverId={server_id or '未指定'}")
                         else:
                             # ptoken 失败：仍然存入 authCode，让本地端尝试（可能已过期，但留个记录）
@@ -487,8 +612,7 @@ def _poll_for_authcode(session_token: str, server_id: str):
                                 'url':        '',
                                 'form':       {},
                             }
-                            with lock:
-                                authcodes.append(entry)
+                            _add_authcode(entry)
                         return
                     else:
                         debug_log(f"[POLL] ❌ queryPcGameAuthInfo 未返回 authCode: {auth_data}", "ERROR")
@@ -677,8 +801,7 @@ def callback():
         'form':     form_data,
     }
 
-    with lock:
-        authcodes.append(entry)
+    _add_authcode(entry)
 
     if auth_code:
         debug_log(f"[CALLBACK] ✅ 成功获取 authCode! serverId={server_id or '未指定'}")
@@ -718,31 +841,98 @@ def callback():
 
 @app.route('/api/authcodes', methods=['GET'])
 def list_authcodes():
-    """获取待处理的 authCode 列表（本地工具轮询此接口）"""
-    with lock:
+    """List cloud login records with optional filtering and long polling."""
+    openid = str(request.args.get("openid", "") or "").strip()
+    since_id = _to_int(request.args.get("since_id") or request.args.get("since"), 0)
+    wait_seconds = min(max(_to_int(request.args.get("wait"), 0), 0), 30)
+    brief = str(request.args.get("brief", "0")).lower() in ("1", "true", "yes")
+
+    with authcode_changed:
+        if wait_seconds:
+            deadline = time.monotonic() + wait_seconds
+            while True:
+                matched = [
+                    row for row in authcodes
+                    if _entry_matches(row, openid=openid, since_id=since_id)
+                ]
+                if matched:
+                    break
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    matched = []
+                    break
+                authcode_changed.wait(timeout=min(remain, 5))
+        else:
+            matched = [
+                row for row in authcodes
+                if _entry_matches(row, openid=openid, since_id=since_id)
+            ]
+
+        rows = [_compact_authcode(row) for row in matched] if brief else [dict(row) for row in matched]
+        latest_id = max((_to_int(row.get("id"), 0) for row in authcodes), default=0)
         return jsonify({
             "ok": True,
-            "count": len(authcodes),
-            "authcodes": authcodes
+            "count": len(rows),
+            "latest_id": latest_id,
+            "authcodes": rows
+        })
+
+
+@app.route('/api/authcodes/listen', methods=['GET'])
+def listen_authcodes():
+    """Wait briefly for records newer than since_id; used by the GUI scan listener."""
+    since_id = _to_int(request.args.get("since_id") or request.args.get("since"), 0)
+    wait_seconds = min(max(_to_int(request.args.get("wait"), 3), 0), 10)
+
+    with authcode_changed:
+        latest_id = max((_to_int(row.get("id"), 0) for row in authcodes), default=0)
+        if since_id > latest_id:
+            # If the cloud store was reset/restarted without the old id sequence,
+            # do not let a stale local cursor hide fresh scan records.
+            since_id = 0
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            matched = [
+                row for row in authcodes
+                if _entry_matches(row, since_id=since_id)
+            ]
+            if matched:
+                break
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                matched = []
+                break
+            authcode_changed.wait(timeout=min(remain, 1))
+
+        latest_id = max((_to_int(row.get("id"), 0) for row in authcodes), default=since_id)
+        return jsonify({
+            "ok": True,
+            "count": len(matched),
+            "latest_id": latest_id,
+            "authcodes": [dict(row) for row in matched],
         })
 
 
 @app.route('/api/authcodes/<int:index>', methods=['DELETE'])
 def consume_authcode(index):
     """消费（删除）一个已处理的 authCode"""
-    with lock:
-        if 0 <= index < len(authcodes):
-            removed = authcodes.pop(index)
-            return jsonify({"ok": True, "removed": removed.get('authCode', '')})
+    with authcode_changed:
+        removed = _delete_authcode_locked(index)
+        if removed is not None:
+            _save_authcodes_locked()
+            authcode_changed.notify_all()
+            return jsonify({"ok": True, "removed": removed.get('authCode', ''), "id": removed.get("id")})
     return jsonify({"ok": False, "msg": "index out of range"})
 
 
 @app.route('/api/authcodes/clear', methods=['POST'])
 def clear_authcodes():
     """清空所有 authCode"""
-    with lock:
+    with authcode_changed:
         count = len(authcodes)
         authcodes.clear()
+        _save_authcodes_locked()
+        authcode_changed.notify_all()
     return jsonify({"ok": True, "msg": f"Cleared {count} authcodes"})
 
 
@@ -750,7 +940,7 @@ def clear_authcodes():
 def list_accounts():
     """兼容旧接口"""
     with lock:
-        compat = [{'time': a['time'], 'ip': a['ip'], 'params': a['params']} for a in authcodes]
+        compat = [{'time': a.get('time', ''), 'ip': a.get('ip', ''), 'params': a.get('params', {})} for a in authcodes]
         return jsonify({"ok": True, "count": len(compat), "accounts": compat})
 
 
@@ -828,8 +1018,7 @@ def report_token():
         'raw_data': data,
     }
 
-    with lock:
-        authcodes.append(entry)
+    _add_authcode(entry)
 
     if token_value:
         debug_log(f"[REPORT-TOKEN] >>> 捕获到 token! (len={len(token_value)}) <<<")
