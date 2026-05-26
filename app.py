@@ -135,8 +135,8 @@ def _get_db() -> sqlite3.Connection:
     return _db_local.conn
 
 
-def _init_db():
-    """初始化数据库表"""
+def _init_db() -> int:
+    """初始化数据库表，并清理同 openid 的历史重复记录。"""
     db = _get_db()
     db.execute("""
         CREATE TABLE IF NOT EXISTS authcodes (
@@ -157,7 +157,36 @@ def _init_db():
         )
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON authcodes(created_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_authcodes_openid ON authcodes(openid)")
+    db.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_authcodes_openid_unique
+        ON authcodes(openid)
+        WHERE openid IS NOT NULL AND openid <> ''
+    """)
+    deduped = _db_dedupe_keep_latest(db)
     db.commit()
+    return deduped
+
+
+def _db_dedupe_keep_latest(db: sqlite3.Connection | None = None) -> int:
+    """同 openid 仅保留最新一条；返回删除条数。"""
+    own_db = db is None
+    if db is None:
+        db = _get_db()
+    result = db.execute("""
+        DELETE FROM authcodes
+        WHERE openid IS NOT NULL
+          AND openid <> ''
+          AND id NOT IN (
+              SELECT MAX(id)
+              FROM authcodes
+              WHERE openid IS NOT NULL AND openid <> ''
+              GROUP BY openid
+          )
+    """)
+    if own_db:
+        db.commit()
+    return int(result.rowcount or 0)
 
 
 def _db_insert(entry: dict):
@@ -907,6 +936,7 @@ def list_authcodes():
     since_id = int(request.args.get("since_id") or request.args.get("since") or 0)
     wait_seconds = min(max(int(request.args.get("wait") or 0), 0), 30)
     brief = str(request.args.get("brief", "0")).lower() in ("1", "true", "yes")
+    latest_only = str(request.args.get("latest", "0")).lower() in ("1", "true", "yes")
 
     if wait_seconds:
         with authcode_changed:
@@ -922,6 +952,9 @@ def list_authcodes():
                 authcode_changed.wait(timeout=min(remain, 5))
     else:
         items = _db_list(openid=openid, since_id=since_id)
+
+    if latest_only and items:
+        items = [items[-1]]
 
     out_items = [_compact_authcode(row) for row in items] if brief else items
     return jsonify({
@@ -1145,8 +1178,10 @@ def debug_page():
 # ==================== 启动 ====================
 
 # 应用启动时初始化（兼容 gunicorn 和直接运行）
-_init_db()
+_deduped = _init_db()
 debug_log("[INIT] SQLite 数据库初始化完成")
+if _deduped > 0:
+    debug_log(f"[INIT] 已清理同 openid 历史重复记录 {_deduped} 条")
 _cleanup_thread = threading.Thread(target=_daily_cleanup_thread, daemon=True)
 _cleanup_thread.start()
 debug_log("[INIT] 自动清理线程已启动（每日清理30天前记录）")
