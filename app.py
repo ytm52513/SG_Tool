@@ -46,6 +46,13 @@ API_HEADERS = {
     'x-webgw-version': '2.0'
 }
 
+GAME_HEADERS = {
+    'content-type': 'application/x-www-form-urlencoded',
+    'user-agent': 'Mozilla/5.0 AlipayMiniApp',
+    'origin': 'https://www.wanyiwan.top',
+    'referer': 'https://www.wanyiwan.top/',
+}
+
 # ==================== ptoken 兑换（服务端直接完成，避免 authCode 过期）====================
 PTOKEN_URL   = "https://pvt-api.8rn4u.com/h5verify/ptoken"
 PTOKEN_SIGN_KEY = "Jp*4Y8vQOYck2*&Z"
@@ -53,12 +60,54 @@ PTOKEN_GID   = "1021669"
 PTOKEN_PID   = "783"
 PTOKEN_OS    = "android"
 PTOKEN_VER   = "4.5.22"
+SERVER_LIST_URL = "https://login-sg-35.akbing.com/Web/newPackageServerList"
+GAME_CHANNEL_ID = 40
+GAME_PACKAGE_MARK = "40005001"
+GAME_PACKAGE_VERSION = "3.2.0.1433"
+GAME_LANGUAGE = "zh_cn"
 
 
 def _ptoken_sign(params: dict) -> str:
     """ptoken 接口签名：key 排序后 key=val 直接拼接（无分隔符）+ 密钥，MD5"""
     sorted_str = "".join(f"{k}={v}" for k, v in sorted(params.items()) if v != "")
     return hashlib.md5((sorted_str + PTOKEN_SIGN_KEY).encode()).hexdigest()
+
+
+def _query_game_openid_from_token(game_token: str) -> str:
+    """用游戏 token 查询真正的游戏 openId。"""
+    token = str(game_token or "").strip()
+    if not token:
+        return ""
+    body_param = json.dumps({
+        "openId": "",
+        "channelId": GAME_CHANNEL_ID,
+        "language": GAME_LANGUAGE,
+        "token": token,
+        "gid": PTOKEN_GID,
+        "pid": PTOKEN_PID,
+        "platformUserId": "",
+        "packageMark": GAME_PACKAGE_MARK,
+        "packageVersion": GAME_PACKAGE_VERSION,
+        "hotPackVersion": GAME_PACKAGE_VERSION,
+        "appId": "0",
+        "childGameId": "0",
+    }, separators=(',', ':'), ensure_ascii=False)
+    try:
+        resp = requests.post(
+            SERVER_LIST_URL,
+            data=f"param={requests.utils.quote(body_param)}",
+            headers=GAME_HEADERS,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if str(data.get('msg', '') or '').lower() != 'success':
+            debug_log(f"[SERVERLIST] 失败: {data}", "WARN")
+            return ""
+        return str(data.get('openId') or '').strip()
+    except Exception as e:
+        debug_log(f"[SERVERLIST] 异常: {e}", "WARN")
+        return ""
 
 
 def exchange_authcode_to_token(auth_code: str) -> dict | None:
@@ -103,9 +152,16 @@ def exchange_authcode_to_token(auth_code: str) -> dict | None:
         if data.get('state') == 1:
             d = data.get('data', {})
             token  = d.get('token', '')
-            openid = str(d.get('openid') or d.get('puid', ''))
+            ptoken_openid = str(d.get('openid') or d.get('puid', ''))
             if token:
-                return {'game_token': token, 'openid': openid}
+                game_openid = _query_game_openid_from_token(token) or ptoken_openid
+                if game_openid != ptoken_openid:
+                    debug_log(f"[PTOKEN] openid 已校正: ptoken_openid={ptoken_openid} game_openid={game_openid}")
+                return {
+                    'game_token': token,
+                    'openid': game_openid,
+                    'ptoken_openid': ptoken_openid,
+                }
         debug_log(f"[PTOKEN] 失败: {data}", "ERROR")
         return None
     except Exception as e:
@@ -135,8 +191,8 @@ def _get_db() -> sqlite3.Connection:
     return _db_local.conn
 
 
-def _init_db():
-    """初始化数据库表"""
+def _init_db() -> int:
+    """初始化数据库表，并清理同 openid 的历史重复记录。"""
     db = _get_db()
     db.execute("""
         CREATE TABLE IF NOT EXISTS authcodes (
@@ -157,7 +213,64 @@ def _init_db():
         )
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON authcodes(created_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_authcodes_openid ON authcodes(openid)")
+    repaired = _db_repair_openids_from_tokens(db)
+    deduped = _db_dedupe_keep_latest(db)
+    db.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_authcodes_openid_unique
+        ON authcodes(openid)
+        WHERE openid IS NOT NULL AND openid <> ''
+    """)
     db.commit()
+    return repaired + deduped
+
+
+def _db_dedupe_keep_latest(db: sqlite3.Connection | None = None) -> int:
+    """同 openid 仅保留最新一条；返回删除条数。"""
+    own_db = db is None
+    if db is None:
+        db = _get_db()
+    result = db.execute("""
+        DELETE FROM authcodes
+        WHERE openid IS NOT NULL
+          AND openid <> ''
+          AND id NOT IN (
+              SELECT MAX(id)
+              FROM authcodes
+              WHERE openid IS NOT NULL AND openid <> ''
+              GROUP BY openid
+          )
+    """)
+    if own_db:
+        db.commit()
+    return int(result.rowcount or 0)
+
+
+def _db_repair_openids_from_tokens(db: sqlite3.Connection | None = None) -> int:
+    """修正历史记录中被存成支付宝标识的 openid。"""
+    own_db = db is None
+    if db is None:
+        db = _get_db()
+    rows = db.execute("""
+        SELECT id, game_token, openid
+        FROM authcodes
+        WHERE game_token IS NOT NULL AND game_token <> ''
+        ORDER BY id DESC
+        LIMIT 50
+    """).fetchall()
+    repaired = 0
+    for row in rows:
+        real_openid = _query_game_openid_from_token(row['game_token'])
+        if not real_openid:
+            continue
+        stored_openid = str(row['openid'] or '').strip()
+        if stored_openid == real_openid:
+            continue
+        db.execute("UPDATE authcodes SET openid = ? WHERE id = ?", (real_openid, int(row['id'])))
+        repaired += 1
+    if own_db and repaired:
+        db.commit()
+    return repaired
 
 
 def _db_insert(entry: dict):
@@ -909,6 +1022,7 @@ def list_authcodes():
     since_id = int(request.args.get("since_id") or request.args.get("since") or 0)
     wait_seconds = min(max(int(request.args.get("wait") or 0), 0), 30)
     brief = str(request.args.get("brief", "0")).lower() in ("1", "true", "yes")
+    latest_only = str(request.args.get("latest", "0")).lower() in ("1", "true", "yes")
 
     if wait_seconds:
         with authcode_changed:
@@ -924,6 +1038,9 @@ def list_authcodes():
                 authcode_changed.wait(timeout=min(remain, 5))
     else:
         items = _db_list(openid=openid, since_id=since_id)
+
+    if latest_only and items:
+        items = [items[-1]]
 
     out_items = [_compact_authcode(row) for row in items] if brief else items
     return jsonify({
@@ -1147,8 +1264,10 @@ def debug_page():
 # ==================== 启动 ====================
 
 # 应用启动时初始化（兼容 gunicorn 和直接运行）
-_init_db()
+_deduped = _init_db()
 debug_log("[INIT] SQLite 数据库初始化完成")
+if _deduped > 0:
+    debug_log(f"[INIT] 已清理同 openid 历史重复记录 {_deduped} 条")
 _cleanup_thread = threading.Thread(target=_daily_cleanup_thread, daemon=True)
 _cleanup_thread.start()
 debug_log("[INIT] 自动清理线程已启动（每日清理30天前记录）")
