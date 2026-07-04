@@ -209,9 +209,15 @@ def _init_db() -> int:
             form TEXT DEFAULT '{}',
             report_type TEXT DEFAULT '',
             raw_data TEXT DEFAULT '{}',
+            jwt_token TEXT DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
         )
     """)
+    # 兼容旧表：尝试新增 jwt_token 列（表已存在时忽略）
+    try:
+        db.execute("ALTER TABLE authcodes ADD COLUMN jwt_token TEXT DEFAULT ''")
+    except Exception:
+        pass
     db.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON authcodes(created_at)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_authcodes_openid ON authcodes(openid)")
     repaired = _db_repair_openids_from_tokens(db)
@@ -281,8 +287,8 @@ def _db_insert(entry: dict):
         if openid:
             db.execute("DELETE FROM authcodes WHERE openid = ?", (openid,))
         cur = db.execute("""
-            INSERT INTO authcodes (time, ip, authCode, game_token, openid, aliUserId, serverId, params, url, form, report_type, raw_data)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO authcodes (time, ip, authCode, game_token, openid, aliUserId, serverId, params, url, form, report_type, raw_data, jwt_token)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             entry.get('time', ''),
             entry.get('ip', ''),
@@ -296,6 +302,7 @@ def _db_insert(entry: dict):
             json.dumps(entry.get('form', {}), ensure_ascii=False),
             entry.get('report_type', ''),
             json.dumps(entry.get('raw_data', {}), ensure_ascii=False, default=str),
+            entry.get('jwt_token', ''),
         ))
         db.commit()
         authcode_changed.notify_all()
@@ -338,6 +345,7 @@ def _compact_authcode(row: dict) -> dict:
         "serverId": row.get("serverId", ""),
         "has_game_token": bool(row.get("game_token") or row.get("token")),
         "has_authCode": bool(row.get("authCode") or row.get("auth_code")),
+        "has_jwt_token": bool(row.get("jwt_token")),
     }
 
 
@@ -771,6 +779,7 @@ def _poll_for_authcode(session_token: str, server_id: str):
                                 'params':     {'authCode': auth_code, 'server': server_id},
                                 'url':        '',
                                 'form':       {},
+                                'jwt_token':  str(new_token),
                             }
                             _db_insert(entry)
                             debug_log(f"[POLL] ✅ token 兑换成功并存储! userId={user_id} openid={tok_data['openid']} serverId={server_id or '未指定'}")
@@ -1092,6 +1101,93 @@ def consume_authcode(idx):
     if removed:
         return jsonify({"ok": True, "removed": removed.get('authCode', '')})
     return jsonify({"ok": False, "msg": "index out of range"})
+
+
+@app.route('/api/authcodes/refresh', methods=['POST'])
+def refresh_authcode():
+    """
+    用 JWT token 刷新 game_token（无需重新扫码）。
+
+    JWT token 来自 loginForPc 的返回，有效期较长（按月计），
+    可在 game_token 过期后用来获取新的 authCode → 新 game_token。
+
+    POST JSON:
+      jwt_token: str  (必填)
+      openid: str     (可选，用于 DB 去重)
+
+    返回:
+      game_token: str
+      openid: str
+      authCode: str
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    jwt_token = str(data.get('jwt_token', '') or '').strip()
+    openid = str(data.get('openid', '') or '').strip()
+
+    if not jwt_token:
+        return jsonify({"ok": False, "msg": "jwt_token required"}), 400
+
+    APP_ID = "2021004170660258"
+    AUTH_INFO_URL = (
+        "https://webgwmobiler.alipay.com/gamecenterhome/com.alipay.gamecenterhome"
+        ".common.facade.service.GameCenterPcGameFacade/queryPcGameAuthInfo"
+        "/uprodhatchstation66500008?ctoken=bigfish_ctoken_1a76c5jk1b"
+    )
+
+    headers = dict(API_HEADERS)
+    headers['x-game-token-pcweb'] = jwt_token
+
+    debug_log(f"[REFRESH] 用 JWT token 刷新 game_token (openid={openid or '未指定'})")
+
+    try:
+        auth_resp = requests.post(
+            AUTH_INFO_URL,
+            headers=headers,
+            json={"appId": APP_ID},
+            timeout=10
+        )
+        auth_data = auth_resp.json()
+        debug_log(f"[REFRESH] queryPcGameAuthInfo success={auth_data.get('success')}")
+
+        if auth_data.get('success') and auth_data.get('data'):
+            auth_code = auth_data['data'].get('authCode', '')
+            if auth_code:
+                debug_log(f"[REFRESH] authCode 获取成功，兑换 game_token...")
+                tok_data = exchange_authcode_to_token(auth_code)
+                if tok_data:
+                    resolved_openid = tok_data['openid'] or openid
+                    entry = {
+                        'time':       datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'ip':         'refresh-endpoint',
+                        'authCode':   auth_code,
+                        'game_token': tok_data['game_token'],
+                        'openid':     resolved_openid,
+                        'serverId':   '',
+                        'params':     {},
+                        'url':        '',
+                        'form':       {},
+                        'jwt_token':  jwt_token,
+                    }
+                    _db_insert(entry)
+                    debug_log(f"[REFRESH] ✅ 刷新成功! openid={resolved_openid}")
+                    return jsonify({
+                        "ok": True,
+                        "game_token": tok_data['game_token'],
+                        "openid": resolved_openid,
+                        "authCode": auth_code,
+                    })
+                else:
+                    debug_log(f"[REFRESH] ptoken 兑换失败", "ERROR")
+                    return jsonify({"ok": False, "msg": "ptoken exchange failed"}), 502
+            else:
+                debug_log(f"[REFRESH] authCode 为空: {auth_data}", "WARN")
+                return jsonify({"ok": False, "msg": "no authCode in response"}), 502
+        else:
+            debug_log(f"[REFRESH] queryPcGameAuthInfo 失败: {auth_data}", "WARN")
+            return jsonify({"ok": False, "msg": f"queryPcGameAuthInfo failed: {auth_data.get('msg','')}"}), 502
+    except Exception as e:
+        debug_log(f"[REFRESH] 异常: {e}", "ERROR")
+        return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 @app.route('/api/authcodes/clear', methods=['POST'])
