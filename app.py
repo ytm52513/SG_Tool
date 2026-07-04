@@ -569,7 +569,9 @@ def index():
         {'<span class="server-tag">区服 ' + server_id + '</span>' if server_id else ''}
         <span class="badge">实时二维码</span>
         <div class="qr-box">
-            <img src="{qr_img_url}" alt="登录二维码">
+            <a href="{login_url}" target="_blank">
+                <img src="{qr_img_url}" alt="登录二维码">
+            </a>
         </div>
         <div class="tip">
             打开支付宝 App 扫描二维码<br>
