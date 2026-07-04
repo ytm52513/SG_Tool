@@ -346,6 +346,7 @@ def _compact_authcode(row: dict) -> dict:
         "has_game_token": bool(row.get("game_token") or row.get("token")),
         "has_authCode": bool(row.get("authCode") or row.get("auth_code")),
         "has_jwt_token": bool(row.get("jwt_token")),
+        "jwt_token": row.get("jwt_token", "") or "",
     }
 
 
