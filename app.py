@@ -213,11 +213,12 @@ def _init_db() -> int:
             created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
         )
     """)
-    # 兼容旧表：尝试新增 jwt_token 列（表已存在时忽略）
-    try:
-        db.execute("ALTER TABLE authcodes ADD COLUMN jwt_token TEXT DEFAULT ''")
-    except Exception:
-        pass
+    # 兼容旧表：尝试新增字段（表已存在时忽略）
+    for col in ("jwt_token", "spanner"):
+        try:
+            db.execute(f"ALTER TABLE authcodes ADD COLUMN {col} TEXT DEFAULT ''")
+        except Exception:
+            pass
     db.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON authcodes(created_at)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_authcodes_openid ON authcodes(openid)")
     repaired = _db_repair_openids_from_tokens(db)
@@ -287,8 +288,8 @@ def _db_insert(entry: dict):
         if openid:
             db.execute("DELETE FROM authcodes WHERE openid = ?", (openid,))
         cur = db.execute("""
-            INSERT INTO authcodes (time, ip, authCode, game_token, openid, aliUserId, serverId, params, url, form, report_type, raw_data, jwt_token)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO authcodes (time, ip, authCode, game_token, openid, aliUserId, serverId, params, url, form, report_type, raw_data, jwt_token, spanner)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             entry.get('time', ''),
             entry.get('ip', ''),
@@ -303,6 +304,7 @@ def _db_insert(entry: dict):
             entry.get('report_type', ''),
             json.dumps(entry.get('raw_data', {}), ensure_ascii=False, default=str),
             entry.get('jwt_token', ''),
+            entry.get('spanner', ''),
         ))
         db.commit()
         authcode_changed.notify_all()
@@ -347,6 +349,7 @@ def _compact_authcode(row: dict) -> dict:
         "has_authCode": bool(row.get("authCode") or row.get("auth_code")),
         "has_jwt_token": bool(row.get("jwt_token")),
         "jwt_token": row.get("jwt_token", "") or "",
+        "spanner": row.get("spanner", "") or "",
     }
 
 
@@ -751,10 +754,17 @@ def _poll_for_authcode(session_token: str, server_id: str):
             if data.get('success') and data.get('data'):
                 user_id = data['data'].get('userId', '')
                 new_token = data['data'].get('token', session_token)
-                debug_log(f"[POLL] ✅ 扫码成功! userId={user_id}，获取 authCode...")
+                # 从 loginForPc 响应中提取 spanner Cookie
+                set_cookie = resp.headers.get('Set-Cookie', '')
+                spanner_cookie = [c.strip() for c in set_cookie.split(';') if c.strip().startswith('spanner=')]
+                poll_cookie = spanner_cookie[0] if spanner_cookie else ''
+                debug_log(f"[POLL] ✅ 扫码成功! userId={user_id}，cookie={'有' if poll_cookie else '无'}，获取 authCode...")
 
-                # 拿 authCode
-                headers['x-game-token-pcweb'] = new_token
+                # 拿 authCode（带上 Cookie）
+                auth_headers = dict(API_HEADERS)
+                auth_headers['x-game-token-pcweb'] = new_token
+                if poll_cookie:
+                    auth_headers['Cookie'] = poll_cookie
                 auth_resp = requests.post(
                     AUTH_INFO_URL,
                     headers=headers,
@@ -781,6 +791,7 @@ def _poll_for_authcode(session_token: str, server_id: str):
                                 'url':        '',
                                 'form':       {},
                                 'jwt_token':  str(new_token),
+                                'spanner':    poll_cookie,
                             }
                             _db_insert(entry)
                             debug_log(f"[POLL] ✅ token 兑换成功并存储! userId={user_id} openid={tok_data['openid']} serverId={server_id or '未指定'}")
