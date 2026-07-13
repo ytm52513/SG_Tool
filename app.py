@@ -1149,7 +1149,19 @@ def refresh_authcode():
     headers = dict(API_HEADERS)
     headers['x-game-token-pcweb'] = jwt_token
 
-    debug_log(f"[REFRESH] 用 JWT token 刷新 game_token (openid={openid or '未指定'})")
+    # 从 DB 查找存着的 spanner cookie，带上它访问支付宝（避免 SESSION_EXPIRED）
+    spanner = ""
+    if openid:
+        try:
+            db = _get_db()
+            row = db.execute("SELECT spanner FROM authcodes WHERE openid = ? ORDER BY id DESC LIMIT 1", (openid,)).fetchone()
+            if row and row['spanner']:
+                spanner = row['spanner']
+                headers['Cookie'] = spanner
+        except Exception:
+            pass
+
+    debug_log(f"[REFRESH] 用 JWT token 刷新 game_token (openid={openid or '未指定'}, cookie={'有' if spanner else '无'})")
 
     try:
         auth_resp = requests.post(
@@ -1160,6 +1172,19 @@ def refresh_authcode():
         )
         auth_data = auth_resp.json()
         debug_log(f"[REFRESH] queryPcGameAuthInfo success={auth_data.get('success')}")
+
+        # 保存响应中的新 Cookie
+        resp_set_cookie = auth_resp.headers.get('Set-Cookie', '')
+        if resp_set_cookie and openid:
+            spanner_parts = [c.strip() for c in resp_set_cookie.split(';') if c.strip().startswith('spanner=')]
+            if spanner_parts:
+                spanner = spanner_parts[0]
+                try:
+                    db = _get_db()
+                    db.execute("UPDATE authcodes SET spanner = ? WHERE openid = ?", (spanner, openid))
+                    db.commit()
+                except Exception:
+                    pass
 
         if auth_data.get('success') and auth_data.get('data'):
             auth_code = auth_data['data'].get('authCode', '')
@@ -1179,6 +1204,7 @@ def refresh_authcode():
                         'url':        '',
                         'form':       {},
                         'jwt_token':  jwt_token,
+                        'spanner':    spanner,
                     }
                     _db_insert(entry)
                     debug_log(f"[REFRESH] ✅ 刷新成功! openid={resolved_openid}")
@@ -1187,6 +1213,7 @@ def refresh_authcode():
                         "game_token": tok_data['game_token'],
                         "openid": resolved_openid,
                         "authCode": auth_code,
+                        "spanner": spanner,
                     })
                 else:
                     debug_log(f"[REFRESH] ptoken 兑换失败", "ERROR")
