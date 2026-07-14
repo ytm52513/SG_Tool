@@ -767,7 +767,7 @@ def _poll_for_authcode(session_token: str, server_id: str):
                     auth_headers['Cookie'] = poll_cookie
                 auth_resp = requests.post(
                     AUTH_INFO_URL,
-                    headers=headers,
+                    headers=auth_headers,
                     json={"appId": APP_ID},
                     timeout=10
                 )
